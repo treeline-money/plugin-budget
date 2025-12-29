@@ -1,0 +1,23 @@
+{
+  "id": "budget",
+  "name": "Budget",
+  "version": "0.1.0",
+  "description": "Track spending against tag-based budget categories with rollovers",
+  "author": "Treeline",
+  "icon": "piggy-bank",
+  "main": "index.js",
+  "permissions": {
+    "tables": {
+      "read": [
+        "transactions",
+        "accounts",
+        "sys_plugin_budget_categories",
+        "sys_plugin_budget_rollovers"
+      ],
+      "create": [
+        "sys_plugin_budget_categories",
+        "sys_plugin_budget_rollovers"
+      ]
+    }
+  }
+}
