@@ -142,6 +142,47 @@
     return { expected, actual, percent };
   });
 
+  // Month pacing - compare % of budget spent vs % of month elapsed
+  let monthPacing = $derived.by(() => {
+    // Parse selectedMonth (YYYY-MM format) to get days info
+    const [year, month] = selectedMonth.split('-').map(Number);
+    const lastDay = new Date(year, month, 0); // Last day of the month
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const totalDays = lastDay.getDate();
+    const dayOfMonth = Math.min(Math.max(today.getDate(), 1), totalDays);
+
+    // Determine month type
+    const selectedDate = new Date(year, month - 1, 1);
+    const currentMonthStart = new Date(today.getFullYear(), today.getMonth(), 1);
+    const isCurrentMonth = today.getFullYear() === year && today.getMonth() === month - 1;
+    const isPastMonth = selectedDate < currentMonthStart;
+    const isFutureMonth = selectedDate > currentMonthStart;
+
+    // Time elapsed: 100% for past, 0% for future, actual for current
+    const monthElapsedPercent = isPastMonth ? 100 : (isFutureMonth ? 0 : Math.round((dayOfMonth / totalDays) * 100));
+    const daysRemaining = isCurrentMonth ? totalDays - dayOfMonth : 0;
+
+    // Budget spent percent (expenses only)
+    const spentPercent = budgetSummary.percent;
+
+    // Pacing: negative means ahead (spent less than time elapsed), positive means behind
+    const pacingDiff = spentPercent - monthElapsedPercent;
+
+    return {
+      monthElapsedPercent,
+      daysRemaining,
+      spentPercent,
+      pacingDiff,
+      isCurrentMonth,
+      isPastMonth,
+      isFutureMonth,
+      totalDays,
+      dayOfMonth
+    };
+  });
+
   // Tag autocomplete suggestions
   let tagSuggestions = $derived.by(() => {
     if (!editorForm.tags || allTags.length === 0) return [];
@@ -889,6 +930,46 @@
           <div class="empty-hint">or press <kbd>a</kbd></div>
         </div>
       {:else}
+        <!-- Remaining Hero Card -->
+        <div class="remaining-hero" class:negative={remainingSummary.actual < 0}>
+          <div class="remaining-hero-label">REMAINING</div>
+          <div class="remaining-hero-amount">{formatCurrency(remainingSummary.actual)}</div>
+          <div class="remaining-hero-detail">of {formatCurrency(remainingSummary.expected)} expected</div>
+          <div class="pacing-indicator">
+            <div class="pacing-bars">
+              {#if monthPacing.isCurrentMonth}
+                <div class="pacing-bar">
+                  <div class="pacing-bar-label">Time</div>
+                  <div class="pacing-bar-track">
+                    <div class="pacing-bar-fill time" style="width: {monthPacing.monthElapsedPercent}%"></div>
+                  </div>
+                  <div class="pacing-bar-value">{monthPacing.monthElapsedPercent}%</div>
+                </div>
+              {/if}
+              <div class="pacing-bar">
+                <div class="pacing-bar-label">Spent</div>
+                <div class="pacing-bar-track">
+                  <div class="pacing-bar-fill spent" class:over={monthPacing.spentPercent > 100} class:ahead={monthPacing.pacingDiff < 0} class:behind={monthPacing.pacingDiff > 10} style="width: {Math.min(monthPacing.spentPercent, 100)}%"></div>
+                </div>
+                <div class="pacing-bar-value">{monthPacing.spentPercent}%</div>
+              </div>
+            </div>
+            <div class="pacing-summary">
+              {#if monthPacing.isCurrentMonth}
+                {#if monthPacing.daysRemaining === 0}
+                  Last day of the month
+                {:else}
+                  {monthPacing.daysRemaining} day{monthPacing.daysRemaining === 1 ? '' : 's'} left
+                {/if}
+              {:else if monthPacing.isPastMonth}
+                Month complete
+              {:else}
+                Not started
+              {/if}
+            </div>
+          </div>
+        </div>
+
         <!-- Income Section -->
         <div class="section">
           <div class="section-header income-header">
@@ -1002,19 +1083,6 @@
             </div>
           {/each}
           <button class="add-row" onclick={() => startAddCategory("expense")}>+ Add category</button>
-        </div>
-
-        <!-- Remaining Row -->
-        <div class="remaining-row">
-          <div class="row-name remaining-label">REMAINING</div>
-          <div class="row-bar">
-            <div class="bar-bg"><div class="bar-fill" style="width: {Math.min(Math.max(remainingSummary.percent, 0), 100)}%; background: {remainingSummary.actual >= 0 ? 'var(--accent-success, #22c55e)' : 'var(--accent-danger, #ef4444)'}"></div></div>
-          </div>
-          <div class="row-actual" style="color: {remainingSummary.actual >= 0 ? 'var(--accent-success, #22c55e)' : 'var(--accent-danger, #ef4444)'}">{formatCurrency(remainingSummary.actual)}</div>
-          <div class="row-expected">/ {formatCurrency(remainingSummary.expected)}</div>
-          <div class="row-percent" style="color: {remainingSummary.actual >= remainingSummary.expected ? 'var(--accent-success, #22c55e)' : 'var(--text-muted)'}">{remainingSummary.percent}%</div>
-          <div class="transfer-btn-placeholder"></div>
-          <div class="row-details-placeholder"></div>
         </div>
       {/if}
     </div>
@@ -1588,19 +1656,107 @@
     color: var(--text-primary);
   }
 
-  .remaining-row {
+  /* Remaining Hero Card */
+  .remaining-hero {
     display: flex;
+    flex-direction: column;
     align-items: center;
-    padding: 10px var(--spacing-lg);
-    margin-top: var(--spacing-sm);
+    padding: var(--spacing-lg);
     background: var(--bg-secondary);
-    border-top: 2px solid var(--border-primary);
-    gap: var(--spacing-md);
+    border-bottom: 1px solid var(--border-primary);
   }
 
-  .remaining-label {
+  .remaining-hero-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .remaining-hero-amount {
+    font-size: 32px;
     font-weight: 700;
-    color: var(--text-primary);
+    color: var(--accent-success, #22c55e);
+    font-family: var(--font-mono, monospace);
+  }
+
+  .remaining-hero.negative .remaining-hero-amount {
+    color: var(--accent-danger, #ef4444);
+  }
+
+  .remaining-hero-detail {
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  /* Pacing Indicator */
+  .pacing-indicator {
+    margin-top: var(--spacing-md);
+    width: 200px;
+  }
+
+  .pacing-bars {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .pacing-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .pacing-bar-label {
+    width: 36px;
+    font-size: 10px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+  }
+
+  .pacing-bar-track {
+    flex: 1;
+    height: 4px;
+    background: var(--bg-tertiary);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .pacing-bar-fill {
+    height: 100%;
+    border-radius: 2px;
+    transition: width 0.3s;
+  }
+
+  .pacing-bar-fill.time {
+    background: var(--text-muted);
+  }
+
+  .pacing-bar-fill.spent {
+    background: var(--accent-success, #22c55e);
+  }
+
+  .pacing-bar-fill.spent.behind {
+    background: var(--accent-warning, #f59e0b);
+  }
+
+  .pacing-bar-fill.spent.over {
+    background: var(--accent-danger, #ef4444);
+  }
+
+  .pacing-bar-value {
+    width: 32px;
+    font-size: 10px;
+    color: var(--text-muted);
+    text-align: right;
+  }
+
+  .pacing-summary {
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--text-muted);
+    text-align: center;
   }
 
   .add-row {
@@ -1640,46 +1796,55 @@
   }
 
   .row-name {
-    width: 180px;
-    flex-shrink: 0;
+    flex: 1;
+    min-width: 100px;
     color: var(--text-primary);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
 
-  .row-bar { flex: 1; min-width: 100px; }
+  .row-bar {
+    width: 80px;
+    flex-shrink: 0;
+  }
 
   .bar-bg {
-    height: 6px;
+    height: 4px;
     background: var(--bg-tertiary);
-    border-radius: 3px;
+    border-radius: 2px;
     overflow: hidden;
   }
 
   .bar-fill {
     height: 100%;
-    border-radius: 3px;
+    border-radius: 2px;
     transition: width 0.2s;
   }
 
   .row-actual {
-    width: 80px;
+    width: 90px;
+    flex-shrink: 0;
     text-align: right;
     color: var(--text-primary);
     font-weight: 600;
+    white-space: nowrap;
   }
 
   .row-expected {
-    width: 80px;
+    width: 95px;
+    flex-shrink: 0;
     text-align: right;
     color: var(--text-muted);
+    white-space: nowrap;
   }
 
   .row-percent {
     width: 50px;
+    flex-shrink: 0;
     text-align: right;
     font-weight: 600;
+    white-space: nowrap;
   }
 
   .row-details-placeholder, .transfer-btn-placeholder {
@@ -1835,7 +2000,7 @@
   }
 
   .trend-amount {
-    width: 55px;
+    width: 72px;
     text-align: right;
     color: var(--text-secondary);
     font-family: var(--font-mono);
