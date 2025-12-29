@@ -283,9 +283,12 @@ export async function loadMonthData(sdk: PluginSDK, month: string): Promise<{
   outgoingRollovers: Transfer[];
   incomingRollovers: Transfer[];
 }> {
-  const categories = await loadCategories(sdk, month);
-  const outgoingRollovers = await loadOutgoingRollovers(sdk, month);
-  const incomingRollovers = await loadIncomingRollovers(sdk, month);
+  // Run all three queries in parallel
+  const [categories, outgoingRollovers, incomingRollovers] = await Promise.all([
+    loadCategories(sdk, month),
+    loadOutgoingRollovers(sdk, month),
+    loadIncomingRollovers(sdk, month),
+  ]);
 
   return {
     categories,

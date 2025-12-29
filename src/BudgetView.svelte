@@ -352,69 +352,105 @@
     }
   }
 
+  // Helper: Check if transaction tags match category criteria
+  function transactionMatchesCategory(txTags: string[], cat: BudgetCategory): boolean {
+    if (cat.tags.length === 0) return false;
+    if (cat.require_all) {
+      return cat.tags.every(tag => txTags.includes(tag));
+    } else {
+      return cat.tags.some(tag => txTags.includes(tag));
+    }
+  }
+
+  // Batched: Load all transactions for a month, compute actuals in JS
   async function calculateActualsForMonth(month: string): Promise<BudgetActual[]> {
     if (!month || categories.length === 0) return [];
     const accountFilter = buildAccountFilterWithParams();
-    const results = await Promise.all(categories.map(async (cat) => {
-      try {
-        const tagCondition = buildTagConditionWithParams(cat.tags, cat.require_all);
-        const amountCondition = cat.amount_sign === "positive" ? "AND amount > 0" : cat.amount_sign === "negative" ? "AND amount < 0" : "";
-        const sql = `SELECT COALESCE(ABS(SUM(amount)), 0) as total FROM transactions
-          WHERE strftime('%Y-%m', transaction_date) = ?
-          AND ${tagCondition.sql} ${amountCondition} ${accountFilter.sql}`;
-        const params = [month, ...tagCondition.params, ...accountFilter.params];
-        const result = await sdk.query<unknown[]>(sql, params);
-        return { id: cat.id, total: (result[0]?.[0] as number) || 0 };
-      } catch {
-        return { id: cat.id, total: 0 };
-      }
-    }));
-    const totalsById = new Map(results.map(r => [r.id, r.total]));
-    return categories.map(cat => {
-      const actual = totalsById.get(cat.id) || 0;
-      const variance = cat.type === "income" ? actual - cat.expected : cat.expected - actual;
-      const percentUsed = cat.expected > 0 ? Math.floor((actual / cat.expected) * 100) : (actual > 0 ? 100 : 0);
-      return { id: cat.id, type: cat.type, category: cat.category, expected: cat.expected, actual, variance, percentUsed };
-    });
+
+    // Single query: get all transactions for the month
+    const sql = `SELECT tags, amount FROM transactions
+      WHERE strftime('%Y-%m', transaction_date) = ? ${accountFilter.sql}`;
+    const params = [month, ...accountFilter.params];
+
+    try {
+      const rows = await sdk.query<unknown[]>(sql, params);
+      const transactions = rows.map(row => ({
+        tags: (row[0] as string[]) || [],
+        amount: row[1] as number
+      }));
+
+      // Compute totals for each category in JS
+      // Note: SQL uses ABS(SUM(amount)) - sum first, then abs
+      return categories.map(cat => {
+        let sum = 0;
+        for (const tx of transactions) {
+          if (!transactionMatchesCategory(tx.tags, cat)) continue;
+          // Apply amount_sign filter
+          if (cat.amount_sign === "positive" && tx.amount <= 0) continue;
+          if (cat.amount_sign === "negative" && tx.amount >= 0) continue;
+          sum += tx.amount;
+        }
+        const total = Math.abs(sum);
+        const variance = cat.type === "income" ? total - cat.expected : cat.expected - total;
+        const percentUsed = cat.expected > 0 ? Math.floor((total / cat.expected) * 100) : (total > 0 ? 100 : 0);
+        return { id: cat.id, type: cat.type, category: cat.category, expected: cat.expected, actual: total, variance, percentUsed };
+      });
+    } catch {
+      return categories.map(cat => ({
+        id: cat.id, type: cat.type, category: cat.category, expected: cat.expected, actual: 0, variance: cat.type === "income" ? -cat.expected : cat.expected, percentUsed: 0
+      }));
+    }
   }
 
   async function calculateActuals() {
     actuals = await calculateActualsForMonth(selectedMonth);
   }
 
+  // Batched: Load all transactions, compute trends in JS
   async function loadAllTrends() {
     if (categories.length === 0) {
       allCategoryTrends = new Map();
       return;
     }
     const accountFilter = buildAccountFilterWithParams();
-    const results = await Promise.all(categories.map(async (cat) => {
-      try {
-        const tagCondition = buildTagConditionWithParams(cat.tags, cat.require_all);
-        const amountCondition = cat.amount_sign === "positive" ? "AND amount > 0" : cat.amount_sign === "negative" ? "AND amount < 0" : "";
-        const sql = `SELECT strftime('%Y-%m', transaction_date) as month, COALESCE(ABS(SUM(amount)), 0) as total
-          FROM transactions
-          WHERE ${tagCondition.sql} ${amountCondition} ${accountFilter.sql}
-          GROUP BY month
-          ORDER BY month DESC
-          LIMIT 6`;
-        const params = [...tagCondition.params, ...accountFilter.params];
-        const result = await sdk.query<unknown[]>(sql, params);
-        const trends: TrendData[] = result.map(row => ({
-          month: row[0] as string,
-          actual: row[1] as number
-        }));
-        return { categoryId: cat.id, trends };
-      } catch {
-        return { categoryId: cat.id, trends: [] };
+
+    // Single query: get all transactions (no date filter, like original)
+    // Then pick last 6 months per category in JS
+    const sql = `SELECT strftime('%Y-%m', transaction_date) as month, tags, amount
+      FROM transactions
+      WHERE 1=1 ${accountFilter.sql}`;
+    const params = [...accountFilter.params];
+
+    try {
+      const rows = await sdk.query<unknown[]>(sql, params);
+      const transactions = rows.map(row => ({
+        month: row[0] as string,
+        tags: (row[1] as string[]) || [],
+        amount: row[2] as number
+      }));
+
+      // Compute trends for each category in JS
+      // Note: SQL uses ABS(SUM(amount)) - sum first, then abs per month
+      const trendsMap = new Map<string, TrendData[]>();
+      for (const cat of categories) {
+        const monthSums = new Map<string, number>();
+        for (const tx of transactions) {
+          if (!transactionMatchesCategory(tx.tags, cat)) continue;
+          if (cat.amount_sign === "positive" && tx.amount <= 0) continue;
+          if (cat.amount_sign === "negative" && tx.amount >= 0) continue;
+          const current = monthSums.get(tx.month) || 0;
+          monthSums.set(tx.month, current + tx.amount);
+        }
+        const trends: TrendData[] = Array.from(monthSums.entries())
+          .map(([month, sum]) => ({ month, actual: Math.abs(sum) }))
+          .sort((a, b) => a.month.localeCompare(b.month))
+          .slice(-6);
+        trendsMap.set(cat.id, trends);
       }
-    }));
-    const trendsMap = new Map<string, TrendData[]>();
-    for (const { categoryId, trends } of results) {
-      trends.sort((a, b) => a.month.localeCompare(b.month));
-      trendsMap.set(categoryId, trends);
+      allCategoryTrends = trendsMap;
+    } catch {
+      allCategoryTrends = new Map();
     }
-    allCategoryTrends = trendsMap;
   }
 
   let initialLoadComplete = false;
@@ -850,7 +886,10 @@
 
   $effect(() => {
     if (selectedMonth && initialLoadComplete) {
-      loadCategories().then(() => Promise.all([calculateActuals(), loadAllTrends()]));
+      isLoading = true;
+      loadCategories()
+        .then(() => Promise.all([calculateActuals(), loadAllTrends()]))
+        .finally(() => { isLoading = false; });
     }
   });
 
