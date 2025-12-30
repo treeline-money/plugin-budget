@@ -10,18 +10,8 @@ export const plugin: Plugin = {
     description: "Track spending against tag-based budget categories with rollovers",
     author: "Treeline",
     permissions: {
-      tables: {
-        read: [
-          "transactions",
-          "accounts",
-          "sys_plugin_budget_categories",
-          "sys_plugin_budget_rollovers",
-        ],
-        create: [
-          "sys_plugin_budget_categories",
-          "sys_plugin_budget_rollovers",
-        ],
-      },
+      read: ["transactions", "accounts"],
+      schemaName: "plugin_budget",
     },
   },
 

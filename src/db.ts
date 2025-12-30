@@ -31,7 +31,7 @@ export async function loadCategories(sdk: PluginSDK, month: string): Promise<Bud
       require_all,
       amount_sign,
       sort_order
-    FROM sys_plugin_budget_categories
+    FROM plugin_budget.categories
     WHERE month = ?
     ORDER BY type DESC, sort_order ASC
   `, [month]);
@@ -52,7 +52,7 @@ export async function loadCategories(sdk: PluginSDK, month: string): Promise<Bud
  */
 export async function hasCategories(sdk: PluginSDK, month: string): Promise<boolean> {
   const result = await sdk.query<unknown[]>(`
-    SELECT COUNT(*) FROM sys_plugin_budget_categories WHERE month = ?
+    SELECT COUNT(*) FROM plugin_budget.categories WHERE month = ?
   `, [month]);
   return (result[0]?.[0] as number) > 0;
 }
@@ -80,7 +80,7 @@ export async function saveCategory(sdk: PluginSDK, month: string, category: Budg
 
   await sdk.execute(
     `
-    INSERT INTO sys_plugin_budget_categories
+    INSERT INTO plugin_budget.categories
       (category_id, month, type, name, expected, tags, require_all, amount_sign, sort_order, updated_at)
     VALUES
       (?, ?, ?, ?, ?, ${tagListSql}, ?, ?, ?, now())
@@ -106,7 +106,7 @@ export async function saveCategory(sdk: PluginSDK, month: string, category: Budg
 export async function saveAllCategories(sdk: PluginSDK, month: string, categories: BudgetCategory[]): Promise<void> {
   // Delete existing categories for this month
   await sdk.execute(
-    `DELETE FROM sys_plugin_budget_categories WHERE month = ?`,
+    `DELETE FROM plugin_budget.categories WHERE month = ?`,
     [month]
   );
 
@@ -126,7 +126,7 @@ export async function saveAllCategories(sdk: PluginSDK, month: string, categorie
  */
 export async function deleteCategory(sdk: PluginSDK, categoryId: string): Promise<void> {
   await sdk.execute(
-    `DELETE FROM sys_plugin_budget_categories WHERE category_id = ?`,
+    `DELETE FROM plugin_budget.categories WHERE category_id = ?`,
     [categoryId]
   );
 }
@@ -160,7 +160,7 @@ export async function copyFromMonth(sdk: PluginSDK, sourceMonth: string, targetM
  */
 export async function getMonthsWithData(sdk: PluginSDK): Promise<string[]> {
   const result = await sdk.query<unknown[]>(`
-    SELECT DISTINCT month FROM sys_plugin_budget_categories ORDER BY month DESC
+    SELECT DISTINCT month FROM plugin_budget.categories ORDER BY month DESC
   `);
   return result.map((row) => row[0] as string);
 }
@@ -175,7 +175,7 @@ export async function getMonthsWithData(sdk: PluginSDK): Promise<string[]> {
 export async function loadOutgoingRollovers(sdk: PluginSDK, sourceMonth: string): Promise<Transfer[]> {
   const result = await sdk.query<unknown[]>(`
     SELECT rollover_id, from_category, to_category, to_month, amount
-    FROM sys_plugin_budget_rollovers
+    FROM plugin_budget.rollovers
     WHERE source_month = ?
   `, [sourceMonth]);
 
@@ -193,7 +193,7 @@ export async function loadOutgoingRollovers(sdk: PluginSDK, sourceMonth: string)
 export async function loadIncomingRollovers(sdk: PluginSDK, targetMonth: string): Promise<Transfer[]> {
   const result = await sdk.query<unknown[]>(`
     SELECT rollover_id, from_category, to_category, source_month, amount
-    FROM sys_plugin_budget_rollovers
+    FROM plugin_budget.rollovers
     WHERE to_month = ?
   `, [targetMonth]);
 
@@ -216,7 +216,7 @@ export async function saveRollover(
 ): Promise<void> {
   await sdk.execute(
     `
-    INSERT INTO sys_plugin_budget_rollovers
+    INSERT INTO plugin_budget.rollovers
       (rollover_id, source_month, from_category, to_category, to_month, amount)
     VALUES
       (?, ?, ?, ?, ?, ?)
@@ -235,7 +235,7 @@ export async function saveRollover(
  */
 export async function deleteRollover(sdk: PluginSDK, rolloverId: string): Promise<void> {
   await sdk.execute(
-    `DELETE FROM sys_plugin_budget_rollovers WHERE rollover_id = ?`,
+    `DELETE FROM plugin_budget.rollovers WHERE rollover_id = ?`,
     [rolloverId]
   );
 }
@@ -245,7 +245,7 @@ export async function deleteRollover(sdk: PluginSDK, rolloverId: string): Promis
  */
 export async function deleteMonthRollovers(sdk: PluginSDK, sourceMonth: string): Promise<void> {
   await sdk.execute(
-    `DELETE FROM sys_plugin_budget_rollovers WHERE source_month = ?`,
+    `DELETE FROM plugin_budget.rollovers WHERE source_month = ?`,
     [sourceMonth]
   );
 }
@@ -377,7 +377,7 @@ export function configToCategories(config: BudgetConfig): BudgetCategory[] {
  */
 export async function hasBudgetData(sdk: PluginSDK): Promise<boolean> {
   const result = await sdk.query<unknown[]>(`
-    SELECT COUNT(*) FROM sys_plugin_budget_categories
+    SELECT COUNT(*) FROM plugin_budget.categories
   `);
   return (result[0]?.[0] as number) > 0;
 }

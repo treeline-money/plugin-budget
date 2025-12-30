@@ -17,9 +17,9 @@ The Budget plugin allows users to track spending against tag-based budget catego
 
 ### Database Tables
 
-The plugin uses two tables (created by core app migrations):
+The plugin uses the `plugin_budget` schema with two tables:
 
-**`sys_plugin_budget_categories`**
+**`plugin_budget.categories`**
 - `category_id` - UUID primary key
 - `month` - YYYY-MM format
 - `type` - "income" or "expense"
@@ -30,7 +30,7 @@ The plugin uses two tables (created by core app migrations):
 - `amount_sign` - "positive", "negative", or "any"
 - `sort_order` - Display order within type
 
-**`sys_plugin_budget_rollovers`**
+**`plugin_budget.rollovers`**
 - `rollover_id` - UUID primary key
 - `source_month` - Month the rollover is from
 - `from_category` - Source category name
