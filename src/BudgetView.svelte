@@ -97,7 +97,8 @@
     month: string;
     actual: number;
   }
-  let allCategoryTrends = $state<Map<string, TrendData[]>>(new Map());
+  // Trend data for currently selected category (loaded on-demand)
+  let categoryTrend = $state<TrendData[]>([]);
 
   // TagInput autocomplete state
   let tagAutocompleteIndex = $state(-1);
@@ -109,8 +110,6 @@
 
   let currentActual = $derived(allActuals[cursorIndex]);
   let currentCategory = $derived(categories.find(c => c.id === currentActual?.id));
-
-  let categoryTrend = $derived(currentCategory ? (allCategoryTrends.get(currentCategory.id) || []) : []);
 
   let currentIncomingTransfers = $derived(
     currentActual ? incomingTransfers.filter(t => t.toCategory === currentActual.category) : []
@@ -406,50 +405,31 @@
     actuals = await calculateActualsForMonth(selectedMonth);
   }
 
-  // Batched: Load all transactions, compute trends in JS
-  async function loadAllTrends() {
-    if (categories.length === 0) {
-      allCategoryTrends = new Map();
+  // Load trends for a single category (on-demand when selected)
+  async function loadCategoryTrend(cat: BudgetCategory) {
+    if (!cat) {
+      categoryTrend = [];
       return;
     }
     const accountFilter = buildAccountFilterWithParams();
+    const tagCondition = buildTagConditionWithParams(cat.tags, cat.require_all);
+    const amountCondition = cat.amount_sign === "positive" ? "AND amount > 0" : cat.amount_sign === "negative" ? "AND amount < 0" : "";
 
-    // Single query: get all transactions (no date filter, like original)
-    // Then pick last 6 months per category in JS
-    const sql = `SELECT strftime('%Y-%m', transaction_date) as month, tags, amount
+    const sql = `SELECT strftime('%Y-%m', transaction_date) as month, COALESCE(ABS(SUM(amount)), 0) as total
       FROM transactions
-      WHERE 1=1 ${accountFilter.sql}`;
-    const params = [...accountFilter.params];
+      WHERE ${tagCondition.sql} ${amountCondition} ${accountFilter.sql}
+      GROUP BY month
+      ORDER BY month DESC
+      LIMIT 6`;
+    const params = [...tagCondition.params, ...accountFilter.params];
 
     try {
-      const rows = await sdk.query<unknown[]>(sql, params);
-      const transactions = rows.map(row => ({
-        month: row[0] as string,
-        tags: (row[1] as string[]) || [],
-        amount: row[2] as number
-      }));
-
-      // Compute trends for each category in JS
-      // Note: SQL uses ABS(SUM(amount)) - sum first, then abs per month
-      const trendsMap = new Map<string, TrendData[]>();
-      for (const cat of categories) {
-        const monthSums = new Map<string, number>();
-        for (const tx of transactions) {
-          if (!transactionMatchesCategory(tx.tags, cat)) continue;
-          if (cat.amount_sign === "positive" && tx.amount <= 0) continue;
-          if (cat.amount_sign === "negative" && tx.amount >= 0) continue;
-          const current = monthSums.get(tx.month) || 0;
-          monthSums.set(tx.month, current + tx.amount);
-        }
-        const trends: TrendData[] = Array.from(monthSums.entries())
-          .map(([month, sum]) => ({ month, actual: Math.abs(sum) }))
-          .sort((a, b) => a.month.localeCompare(b.month))
-          .slice(-6);
-        trendsMap.set(cat.id, trends);
-      }
-      allCategoryTrends = trendsMap;
+      const result = await sdk.query<unknown[]>(sql, params);
+      categoryTrend = result
+        .map(row => ({ month: row[0] as string, actual: row[1] as number }))
+        .sort((a, b) => a.month.localeCompare(b.month));
     } catch {
-      allCategoryTrends = new Map();
+      categoryTrend = [];
     }
   }
 
@@ -471,7 +451,7 @@
       await Promise.all([loadAllTags(), loadAllAccounts()]);
       selectedMonth = targetMonth;
       await loadCategories();
-      await Promise.all([calculateActuals(), loadAllTrends()]);
+      await calculateActuals();
       initialLoadComplete = true;
     } catch (e) {
       error = e instanceof Error ? e.message : "Failed to load budget data";
@@ -888,8 +868,17 @@
     if (selectedMonth && initialLoadComplete) {
       isLoading = true;
       loadCategories()
-        .then(() => Promise.all([calculateActuals(), loadAllTrends()]))
+        .then(() => calculateActuals())
         .finally(() => { isLoading = false; });
+    }
+  });
+
+  // Load trends on-demand when category selection changes
+  $effect(() => {
+    if (currentCategory) {
+      loadCategoryTrend(currentCategory);
+    } else {
+      categoryTrend = [];
     }
   });
 
