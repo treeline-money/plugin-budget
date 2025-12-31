@@ -14,6 +14,62 @@ import type { PluginSDK } from "@treeline-money/plugin-sdk";
 import type { BudgetCategory, BudgetConfig, BudgetConfigCategory, Transfer, AmountSign } from "./types";
 
 // ============================================================================
+// DATABASE INITIALIZATION
+// ============================================================================
+
+/**
+ * Ensure the budget schema and tables exist
+ */
+export async function ensureTables(sdk: PluginSDK): Promise<void> {
+  // Create schema first
+  await sdk.execute(`CREATE SCHEMA IF NOT EXISTS plugin_budget`);
+
+  // Create categories table
+  await sdk.execute(`
+    CREATE TABLE IF NOT EXISTS plugin_budget.categories (
+      category_id VARCHAR PRIMARY KEY,
+      month VARCHAR NOT NULL,
+      type VARCHAR NOT NULL,
+      name VARCHAR NOT NULL,
+      expected DECIMAL(12,2) NOT NULL DEFAULT 0,
+      tags VARCHAR[] DEFAULT [],
+      require_all BOOLEAN DEFAULT FALSE,
+      amount_sign VARCHAR,
+      sort_order INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // Create rollovers table
+  await sdk.execute(`
+    CREATE TABLE IF NOT EXISTS plugin_budget.rollovers (
+      rollover_id VARCHAR PRIMARY KEY,
+      source_month VARCHAR NOT NULL,
+      from_category VARCHAR NOT NULL,
+      to_category VARCHAR NOT NULL,
+      to_month VARCHAR NOT NULL,
+      amount DECIMAL(12,2) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // Create indexes
+  await sdk.execute(`
+    CREATE INDEX IF NOT EXISTS idx_budget_categories_month
+    ON plugin_budget.categories(month)
+  `);
+  await sdk.execute(`
+    CREATE INDEX IF NOT EXISTS idx_budget_rollovers_source
+    ON plugin_budget.rollovers(source_month)
+  `);
+  await sdk.execute(`
+    CREATE INDEX IF NOT EXISTS idx_budget_rollovers_target
+    ON plugin_budget.rollovers(to_month)
+  `);
+}
+
+// ============================================================================
 // CATEGORY OPERATIONS (Month-Scoped)
 // ============================================================================
 

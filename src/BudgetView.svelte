@@ -885,6 +885,7 @@
   let unsubscribeRefresh: (() => void) | null = null;
 
   onMount(async () => {
+    await budgetDb.ensureTables(sdk);
     await loadAll();
     containerEl?.focus();
     unsubscribeRefresh = sdk.onDataRefresh(() => {
