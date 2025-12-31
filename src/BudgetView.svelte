@@ -885,7 +885,7 @@
   let unsubscribeRefresh: (() => void) | null = null;
 
   onMount(async () => {
-    await budgetDb.ensureTables(sdk);
+    // Tables are created by migrations in index.ts - just load data
     await loadAll();
     containerEl?.focus();
     unsubscribeRefresh = sdk.onDataRefresh(() => {

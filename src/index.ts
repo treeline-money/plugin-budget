@@ -1,6 +1,50 @@
-import type { Plugin, PluginContext, PluginSDK } from "@treeline-money/plugin-sdk";
+import type { Plugin, PluginContext, PluginSDK, PluginMigration } from "@treeline-money/plugin-sdk";
 import BudgetView from "./BudgetView.svelte";
 import { mount, unmount } from "svelte";
+
+// Database migrations - run in order by version when plugin loads
+const migrations: PluginMigration[] = [
+  {
+    version: 1,
+    name: "create_categories_table",
+    up: `
+      CREATE TABLE IF NOT EXISTS plugin_budget.categories (
+        category_id VARCHAR PRIMARY KEY,
+        month VARCHAR NOT NULL,
+        type VARCHAR NOT NULL,
+        name VARCHAR NOT NULL,
+        expected DECIMAL(12,2) NOT NULL DEFAULT 0,
+        tags VARCHAR[] DEFAULT [],
+        require_all BOOLEAN DEFAULT FALSE,
+        amount_sign VARCHAR,
+        sort_order INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_budget_categories_month
+        ON plugin_budget.categories(month)
+    `,
+  },
+  {
+    version: 2,
+    name: "create_rollovers_table",
+    up: `
+      CREATE TABLE IF NOT EXISTS plugin_budget.rollovers (
+        rollover_id VARCHAR PRIMARY KEY,
+        source_month VARCHAR NOT NULL,
+        from_category VARCHAR NOT NULL,
+        to_category VARCHAR NOT NULL,
+        to_month VARCHAR NOT NULL,
+        amount DECIMAL(12,2) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_budget_rollovers_source
+        ON plugin_budget.rollovers(source_month);
+      CREATE INDEX IF NOT EXISTS idx_budget_rollovers_target
+        ON plugin_budget.rollovers(to_month)
+    `,
+  },
+];
 
 export const plugin: Plugin = {
   manifest: {
@@ -14,6 +58,8 @@ export const plugin: Plugin = {
       schemaName: "plugin_budget",
     },
   },
+
+  migrations,
 
   activate(context: PluginContext) {
     // Register view with mount function (community plugin pattern)
