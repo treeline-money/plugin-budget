@@ -69,6 +69,9 @@ export async function saveCategory(sdk: PluginSDK, month: string, category: Budg
     ? `list_value(${category.tags.map(() => '?').join(', ')})`
     : `[]::VARCHAR[]`;
 
+  // Use JS-computed timestamp to avoid ICU extension dependency
+  const now = new Date().toISOString();
+
   const params = [
     category.id,
     month,
@@ -79,6 +82,7 @@ export async function saveCategory(sdk: PluginSDK, month: string, category: Budg
     category.require_all,
     category.amount_sign,
     sortOrder,
+    now,
   ];
 
   await sdk.execute(
@@ -86,7 +90,7 @@ export async function saveCategory(sdk: PluginSDK, month: string, category: Budg
     INSERT INTO plugin_budget.categories
       (category_id, month, type, name, expected, tags, require_all, amount_sign, sort_order, updated_at)
     VALUES
-      (?, ?, ?, ?, ?, ${tagListSql}, ?, ?, ?, now())
+      (?, ?, ?, ?, ?, ${tagListSql}, ?, ?, ?, ?::TIMESTAMP)
     ON CONFLICT (category_id) DO UPDATE SET
       month = EXCLUDED.month,
       type = EXCLUDED.type,
@@ -96,7 +100,7 @@ export async function saveCategory(sdk: PluginSDK, month: string, category: Budg
       require_all = EXCLUDED.require_all,
       amount_sign = EXCLUDED.amount_sign,
       sort_order = EXCLUDED.sort_order,
-      updated_at = now()
+      updated_at = EXCLUDED.updated_at
     `,
     params
   );
