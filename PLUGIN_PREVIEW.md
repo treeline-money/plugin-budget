@@ -11,8 +11,7 @@ Create budget categories linked to transaction tags. When you tag a transaction 
 
 - **Category spending** - How much you've spent vs. budgeted in each category
 - **Monthly rollovers** - Unspent budget carries forward automatically
-- **Progress bars** - Visual indicators showing where you stand
-- **Overspending alerts** - Clear warning when you exceed a category
+- **Progress bars** - Color-coded indicators that turn red when you exceed a category
 
 ## Getting started
 
