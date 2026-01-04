@@ -14,13 +14,15 @@ if [[ ! "$VERSION" =~ ^v ]]; then
   VERSION="v$VERSION"
 fi
 
-# Update version in manifest.json
+# Update version in manifest.json and package.json
 MANIFEST_VERSION="${VERSION#v}"
 if command -v jq &> /dev/null; then
   jq ".version = \"$MANIFEST_VERSION\"" manifest.json > manifest.tmp && mv manifest.tmp manifest.json
   echo "Updated manifest.json version to $MANIFEST_VERSION"
+  jq ".version = \"$MANIFEST_VERSION\"" package.json > package.tmp && mv package.tmp package.json
+  echo "Updated package.json version to $MANIFEST_VERSION"
 else
-  echo "Warning: jq not installed, please manually update version in manifest.json"
+  echo "Warning: jq not installed, please manually update version in manifest.json and package.json"
 fi
 
 # Build to verify everything works
@@ -28,8 +30,8 @@ echo "Building plugin..."
 npm run build
 
 # Commit version bump if there are changes
-if ! git diff --quiet manifest.json 2>/dev/null; then
-  git add manifest.json
+if ! git diff --quiet manifest.json package.json 2>/dev/null; then
+  git add manifest.json package.json
   git commit -m "Bump version to $VERSION"
 fi
 
