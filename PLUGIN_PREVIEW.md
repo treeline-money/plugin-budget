@@ -1,6 +1,7 @@
 Track spending against tag-based budget categories with monthly rollovers.
 
-<!-- TODO: Add screenshot -->
+![Budget plugin showing category spending with progress bars](./screenshots/budget-light.png)
+![Budget plugin showing category spending with progress bars](./screenshots/budget-dark.png)
 
 ## How it works
 
