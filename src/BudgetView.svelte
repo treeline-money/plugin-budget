@@ -379,7 +379,8 @@
       }));
 
       // Compute totals for each category in JS
-      // Note: SQL uses ABS(SUM(amount)) - sum first, then abs
+      // Expenses: flip sign so spending is positive, net income is negative
+      // Income: keep as-is (positive = received)
       return categories.map(cat => {
         let sum = 0;
         for (const tx of transactions) {
@@ -389,9 +390,9 @@
           if (cat.amount_sign === "negative" && tx.amount >= 0) continue;
           sum += tx.amount;
         }
-        const total = Math.abs(sum);
+        const total = cat.type === "expense" ? -sum : sum;
         const variance = cat.type === "income" ? total - cat.expected : cat.expected - total;
-        const percentUsed = cat.expected > 0 ? Math.floor((total / cat.expected) * 100) : (total > 0 ? 100 : 0);
+        const percentUsed = cat.expected > 0 ? Math.max(0, Math.floor((total / cat.expected) * 100)) : (total > 0 ? 100 : 0);
         return { id: cat.id, type: cat.type, category: cat.category, expected: cat.expected, actual: total, variance, percentUsed };
       });
     } catch {
@@ -415,7 +416,8 @@
     const tagCondition = buildTagConditionWithParams(cat.tags, cat.require_all);
     const amountCondition = cat.amount_sign === "positive" ? "AND amount > 0" : cat.amount_sign === "negative" ? "AND amount < 0" : "";
 
-    const sql = `SELECT strftime('%Y-%m', transaction_date) as month, COALESCE(ABS(SUM(amount)), 0) as total
+    const sumExpr = cat.type === "expense" ? "-SUM(amount)" : "SUM(amount)";
+    const sql = `SELECT strftime('%Y-%m', transaction_date) as month, COALESCE(${sumExpr}, 0) as total
       FROM transactions
       WHERE ${tagCondition.sql} ${amountCondition} ${accountFilter.sql}
       GROUP BY month
