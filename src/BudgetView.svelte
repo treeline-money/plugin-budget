@@ -42,16 +42,28 @@
   let drillDownTransactions = $state<Transaction[]>([]);
   let drillDownLoading = $state(false);
 
-  // Row menu state
+  // Context menu state
+  let contextMenuActual = $state<BudgetActual | null>(null);
+  let contextMenuPos = $state({ x: 0, y: 0 });
+
+  // Legacy row menu state (kept for compatibility)
   let menuOpenForId = $state<string | null>(null);
 
   function closeMenu() {
     menuOpenForId = null;
+    contextMenuActual = null;
   }
 
   function toggleMenu(id: string, e: MouseEvent) {
     e.stopPropagation();
     menuOpenForId = menuOpenForId === id ? null : id;
+  }
+
+  function handleContextMenu(actual: BudgetActual, e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    contextMenuActual = actual;
+    contextMenuPos = { x: e.clientX, y: e.clientY };
   }
 
   // Editor state
@@ -89,6 +101,66 @@
   let transferRows = $state<TransferRow[]>([]);
   let isEditingTransfers = $state(false);
 
+  // Rollovers modal state — single modal used for both header button and copy flow
+  let showRolloversModal = $state(false);
+  let rolloversFromMonth = $state<string>("");  // source month for rollovers
+  let rolloversFromCopy = $state(false);  // true if opened from copy flow
+
+  function openRolloversModal() {
+    rolloversFromMonth = selectedMonth;
+    rolloversFromCopy = false;
+    const outgoing = outgoingTransfers;
+    copyRolloverRows = budgetActuals.map(actual => {
+      const incomingRollover = getCategoryIncomingRollover(actual.category);
+      const balance = roundToCents(incomingRollover + actual.variance);
+      const existing = outgoing.find(t => t.fromCategory === actual.category);
+      return {
+        category: actual.category,
+        toCategory: existing?.toCategory ?? actual.category,
+        balance,
+        rolloverAmount: existing ? roundToCents(existing.amount) : 0,
+      };
+    });
+    showRolloversModal = true;
+  }
+
+  function openRolloversModalFromCopy(rows: CopyRolloverRow[], sourceMonth: string) {
+    rolloversFromMonth = sourceMonth;
+    rolloversFromCopy = true;
+    copyRolloverRows = rows;
+    showRolloversModal = true;
+  }
+
+  function closeRolloversModal() {
+    showRolloversModal = false;
+    copyRolloverRows = [];
+    rolloversFromMonth = "";
+    if (rolloversFromCopy) {
+      showCopyFromPrevious = false;
+      copySourceMonth = null;
+      rolloversFromCopy = false;
+    }
+    containerEl?.focus();
+  }
+
+  async function saveRolloversFromModal(): Promise<void> {
+    if (!rolloversFromMonth) return;
+    const toMonth = getNextMonth(rolloversFromMonth);
+    const existingRollovers = await budgetDb.loadOutgoingRollovers(sdk, rolloversFromMonth);
+    // Replace all rollovers from this month with the modal's rows
+    const newRollovers: Transfer[] = copyRolloverRows
+      .filter(r => r.rolloverAmount !== 0)
+      .map(r => ({
+        id: generateTransferId(),
+        fromCategory: r.category,
+        toCategory: r.toCategory,
+        amount: roundToCents(r.rolloverAmount),
+      }));
+    await budgetDb.saveMonthRollovers(sdk, rolloversFromMonth, toMonth, newRollovers);
+    await loadCategories();
+    closeRolloversModal();
+  }
+
   // All known tags for autocomplete
   let allTags = $state<string[]>([]);
 
@@ -120,18 +192,32 @@
   let currentIncomingNet = $derived(roundToCents(currentIncomingTransfers.reduce((sum, t) => sum + t.amount, 0)));
   let currentOutgoingNet = $derived(roundToCents(currentOutgoingTransfers.reduce((sum, t) => sum + t.amount, 0)));
 
+  function getCategoryIncomingRollover(categoryName: string): number {
+    return roundToCents(incomingTransfers
+      .filter(t => t.toCategory === categoryName)
+      .reduce((sum, t) => sum + t.amount, 0));
+  }
+
   let incomeSummary = $derived.by(() => {
     const expected = incomeActuals.reduce((sum, a) => sum + a.expected, 0);
     const actual = incomeActuals.reduce((sum, a) => sum + a.actual, 0);
     const percent = expected > 0 ? Math.floor((actual / expected) * 100) : 0;
-    return { expected, actual, percent };
+    const balance = roundToCents(incomeActuals.reduce((sum, a) => sum + getCategoryIncomingRollover(a.category) + a.variance, 0));
+    return { expected, actual, percent, balance };
   });
 
   let budgetSummary = $derived.by(() => {
     const expected = budgetActuals.reduce((sum, a) => sum + a.expected, 0);
     const actual = budgetActuals.reduce((sum, a) => sum + a.actual, 0);
     const percent = expected > 0 ? Math.floor((actual / expected) * 100) : 0;
-    return { expected, actual, percent };
+    const balance = roundToCents(budgetActuals.reduce((sum, a) => sum + getCategoryIncomingRollover(a.category) + a.variance, 0));
+    return { expected, actual, percent, balance };
+  });
+
+  let rolloverSummary = $derived.by(() => {
+    const total = roundToCents(outgoingTransfers.reduce((sum, t) => sum + t.amount, 0));
+    const count = new Set(outgoingTransfers.map(t => t.fromCategory)).size;
+    return { total, count };
   });
 
   let remainingSummary = $derived.by(() => {
@@ -204,20 +290,110 @@
     await budgetDb.saveAllCategories(sdk, selectedMonth, cats);
   }
 
+  // Rollover step during copy flow
+  interface CopyRolloverRow {
+    category: string;
+    toCategory: string;
+    balance: number;
+    rolloverAmount: number;
+  }
+  let copyRolloverRows = $state<CopyRolloverRow[]>([]);
+
   async function copyFromSourceMonth(): Promise<void> {
     if (!selectedMonth || !copySourceMonth) return;
     try {
+      // Copy categories first
       const copiedCategories = await budgetDb.copyFromMonth(sdk, copySourceMonth, selectedMonth);
-      if (copiedCategories.length > 0) {
-        categories = copiedCategories;
-        showCopyFromPrevious = false;
-        copySourceMonth = null;
-        await calculateActuals();
+      if (copiedCategories.length === 0) return;
+      categories = copiedCategories;
+      await calculateActuals();
+
+      {
+        // Load source month data to compute balances for rollover modal
+        const sourceData = await budgetDb.loadMonthData(sdk, copySourceMonth);
+        const sourceCategories = sourceData.categories;
+        const sourceIncoming = sourceData.incomingRollovers;
+        const expenseCategories = sourceCategories.filter(c => c.type === 'expense');
+
+        if (expenseCategories.length > 0) {
+          const { sql: accountSql, params: accountParams } = buildAccountFilterWithParams();
+          const rows: CopyRolloverRow[] = [];
+          for (const cat of expenseCategories) {
+            const signFilter = cat.amount_sign === 'positive' ? 'AND amount > 0'
+              : cat.amount_sign === 'negative' ? 'AND amount < 0' : '';
+            const matchMode = cat.require_all ? 'AND' : 'OR';
+            const tagConditions = cat.tags.map(() =>
+              `list_contains(tags, ?)`
+            ).join(` ${matchMode} `);
+            const result = await sdk.query<unknown[]>(
+              `SELECT COALESCE(SUM(amount), 0) FROM transactions
+               WHERE strftime('%Y-%m', transaction_date) = ?
+               ${accountSql}
+               ${signFilter}
+               AND (${tagConditions || 'FALSE'})`,
+              [copySourceMonth, ...accountParams, ...cat.tags]
+            );
+            const actual = Math.abs(result[0]?.[0] as number || 0);
+            const variance = roundToCents(cat.expected - actual);
+            const incoming = roundToCents(sourceIncoming
+              .filter(t => t.toCategory === cat.category)
+              .reduce((sum, t) => sum + t.amount, 0));
+            const balance = roundToCents(incoming + variance);
+            rows.push({ category: cat.category, toCategory: cat.category, balance, rolloverAmount: balance });
+          }
+          // Open the unified rollovers modal
+          openRolloversModalFromCopy(rows, copySourceMonth);
+          return;
+        }
       }
+      // No expense categories — done
+      showCopyFromPrevious = false;
+      copySourceMonth = null;
     } catch (e) {
       console.error("Failed to copy from source month:", e);
     }
   }
+
+  function getCategoryBalance(categoryName: string): number {
+    const actual = budgetActuals.find(a => a.category === categoryName);
+    if (!actual) return 0;
+    const incomingRollover = getCategoryIncomingRollover(actual.category);
+    return roundToCents(incomingRollover + actual.variance);
+  }
+
+  function addRolloverRow() {
+    const firstCategory = budgetActuals[0]?.category ?? '';
+    copyRolloverRows = [...copyRolloverRows, {
+      category: firstCategory,
+      toCategory: firstCategory,
+      balance: getCategoryBalance(firstCategory),
+      rolloverAmount: 0,
+    }];
+  }
+
+  function removeRolloverRow(index: number) {
+    copyRolloverRows = copyRolloverRows.filter((_, i) => i !== index);
+  }
+
+  function copyRolloverAll() {
+    copyRolloverRows = budgetActuals.map(actual => {
+      const balance = getCategoryBalance(actual.category);
+      return {
+        category: actual.category,
+        toCategory: actual.category,
+        balance,
+        rolloverAmount: balance,
+      };
+    });
+  }
+
+  function copyRolloverNone() {
+    copyRolloverRows = copyRolloverRows.map(r => ({
+      ...r,
+      rolloverAmount: 0,
+    }));
+  }
+
 
   function findNearestMonth(targetMonth: string, availableMonths: string[]): string | null {
     if (availableMonths.length === 0) return null;
@@ -390,7 +566,7 @@
           if (cat.amount_sign === "negative" && tx.amount >= 0) continue;
           sum += tx.amount;
         }
-        const total = cat.type === "expense" ? -sum : sum;
+        const total = cat.type === "expense" ? -sum || 0 : sum || 0;
         const variance = cat.type === "income" ? total - cat.expected : cat.expected - total;
         const percentUsed = cat.expected > 0 ? Math.max(0, Math.floor((total / cat.expected) * 100)) : (total > 0 ? 100 : 0);
         return { id: cat.id, type: cat.type, category: cat.category, expected: cat.expected, actual: total, variance, percentUsed };
@@ -559,7 +735,8 @@
   }
 
   function roundToCents(amount: number): number {
-    return Math.round(amount * 100) / 100;
+    const rounded = Math.round(amount * 100) / 100;
+    return rounded === 0 ? 0 : rounded; // avoid -0
   }
 
   function formatAmount(amount: number): string {
@@ -588,7 +765,7 @@
   }
 
   function handleKeyDown(e: KeyboardEvent) {
-    if (isEditing || showTransactions || showTransferModal) return;
+    if (isEditing || showTransactions || showTransferModal || showRolloversModal || showResetModal) return;
     if ((e.metaKey || e.ctrlKey) && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
       e.preventDefault();
       moveCategory(e.key === "ArrowUp" ? "up" : "down");
@@ -961,160 +1138,170 @@
           <div class="empty-hint">or press <kbd>a</kbd></div>
         </div>
       {:else}
-        <!-- Remaining Hero Card -->
-        <div class="remaining-hero" class:negative={remainingSummary.actual < 0}>
-          <div class="remaining-hero-label">REMAINING</div>
-          <div class="remaining-hero-amount">{formatCurrency(remainingSummary.actual)}</div>
-          <div class="remaining-hero-detail">of {formatCurrency(remainingSummary.expected)} expected</div>
-          <div class="pacing-indicator">
-            <div class="pacing-bars">
+        <!-- Summary Metrics -->
+        <div class="summary-metrics">
+          <div class="metric-card">
+            <div class="metric-label">Planned</div>
+            <div class="metric-value">{formatCurrency(budgetSummary.expected)}</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Actual</div>
+            <div class="metric-value">{formatCurrency(budgetSummary.actual)}</div>
+            <div class="metric-sub">{monthPacing.spentPercent}% of plan</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Balance</div>
+            <div class="metric-value" class:positive={budgetSummary.balance >= 0} class:negative={budgetSummary.balance < 0}>{formatCurrency(budgetSummary.balance)}</div>
+            <div class="metric-sub">incl. rollovers</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Progress</div>
+            <div class="metric-value">
               {#if monthPacing.isCurrentMonth}
-                <div class="pacing-bar">
-                  <div class="pacing-bar-label">Time</div>
-                  <div class="pacing-bar-track">
-                    <div class="pacing-bar-fill time" style="width: {monthPacing.monthElapsedPercent}%"></div>
-                  </div>
-                  <div class="pacing-bar-value">{monthPacing.monthElapsedPercent}%</div>
-                </div>
-              {/if}
-              <div class="pacing-bar">
-                <div class="pacing-bar-label">Spent</div>
-                <div class="pacing-bar-track">
-                  <div class="pacing-bar-fill spent" class:over={monthPacing.spentPercent > 100} class:ahead={monthPacing.pacingDiff < 0} class:behind={monthPacing.pacingDiff > 10} style="width: {Math.min(monthPacing.spentPercent, 100)}%"></div>
-                </div>
-                <div class="pacing-bar-value">{monthPacing.spentPercent}%</div>
-              </div>
-            </div>
-            <div class="pacing-summary">
-              {#if monthPacing.isCurrentMonth}
-                {#if monthPacing.daysRemaining === 0}
-                  Last day of the month
-                {:else}
-                  {monthPacing.daysRemaining} day{monthPacing.daysRemaining === 1 ? '' : 's'} left
-                {/if}
+                {monthPacing.daysRemaining} day{monthPacing.daysRemaining === 1 ? '' : 's'} left
               {:else if monthPacing.isPastMonth}
-                Month complete
+                Complete
               {:else}
                 Not started
               {/if}
             </div>
+            {#if monthPacing.isCurrentMonth}
+              <div class="metric-sub">{monthPacing.monthElapsedPercent}% of month elapsed</div>
+            {/if}
           </div>
+        </div>
+
+        <div class="rollover-summary-line">
+          <span class="rollover-summary-text">
+            Rollovers to {formatMonthShort(getNextMonth(selectedMonth))}:
+            {#if rolloverSummary.count > 0}
+              {rolloverSummary.count} categor{rolloverSummary.count === 1 ? 'y' : 'ies'}, {formatCurrency(rolloverSummary.total)} total
+            {:else}
+              none configured
+            {/if}
+          </span>
+          <button class="tl-btn tl-btn-secondary rollover-edit-btn" onclick={openRolloversModal}>Edit</button>
         </div>
 
         <!-- Income Section -->
-        <div class="section">
-          <div class="section-header income-header">
-            <div class="row-name section-title">INCOME</div>
-            <div class="row-bar"></div>
-            <div class="row-actual">{formatCurrency(incomeSummary.actual)}</div>
-            <div class="row-expected">/ {formatCurrency(incomeSummary.expected)}</div>
-            <div class="row-percent" style="color: {incomeSummary.percent >= 100 ? 'var(--accent-success, #22c55e)' : 'var(--text-muted)'}">{incomeSummary.percent}%</div>
-            <div class="transfer-btn-placeholder"></div>
-            <div class="row-details-placeholder"></div>
-          </div>
-          {#each incomeActuals as actual, i}
-            {@const globalIndex = i}
-            <div
-              class="row"
-              class:cursor={cursorIndex === globalIndex}
-              data-index={globalIndex}
-              onclick={() => handleRowClick(globalIndex)}
-              ondblclick={() => handleRowDoubleClick(globalIndex)}
-              onkeydown={(e) => e.key === 'Enter' && handleRowDoubleClick(globalIndex)}
-              role="option"
-              aria-selected={cursorIndex === globalIndex}
-              tabindex={cursorIndex === globalIndex ? 0 : -1}
-            >
-              <div class="row-name">{actual.category}</div>
-              <div class="row-bar">
-                <div class="bar-bg"><div class="bar-fill" style="width: {Math.min(actual.percentUsed, 100)}%; background: {actual.percentUsed >= 100 ? 'var(--accent-success, #22c55e)' : 'var(--accent-primary)'}"></div></div>
-              </div>
-              <div class="row-actual">{formatCurrency(actual.actual)}</div>
-              <div class="row-expected">/ {formatCurrency(actual.expected)}</div>
-              <div class="row-percent" style="color: {actual.percentUsed >= 100 ? 'var(--accent-success, #22c55e)' : 'var(--text-muted)'}">{actual.percentUsed}%</div>
-              <div class="transfer-btn-placeholder"></div>
-              <!-- Inline RowMenu -->
-              {#if menuOpenForId === actual.id}
-                <button class="menu-backdrop" onclick={(e) => { e.stopPropagation(); closeMenu(); }} aria-label="Close menu"></button>
-              {/if}
-              <div class="row-menu">
-                <button class="row-menu-btn" onclick={(e) => toggleMenu(actual.id, e)} aria-haspopup="true" aria-expanded={menuOpenForId === actual.id}>&#8942;</button>
-                {#if menuOpenForId === actual.id}
-                  <div class="row-menu-dropdown" role="menu">
-                    <button class="menu-item" onclick={() => { loadTransactionsForCategory(actual); closeMenu(); }} role="menuitem">View</button>
-                    <button class="menu-item" onclick={() => { const cat = categories.find(c => c.id === actual.id); if (cat) startEditCategory(cat); closeMenu(); }} role="menuitem">Edit</button>
-                    <button class="menu-item danger" onclick={() => { const cat = categories.find(c => c.id === actual.id); if (cat) deleteCategory(cat); closeMenu(); }} role="menuitem">Delete</button>
-                  </div>
-                {/if}
-              </div>
-            </div>
-          {/each}
-          <button class="add-row" onclick={() => startAddCategory("income")}>+ Add income</button>
-        </div>
-
-        <div class="section-divider"></div>
+        <table class="budget-table">
+          <colgroup>
+            <col style="width: 210px" />
+            <col style="width: 120px" />
+            <col style="width: 120px" />
+            <col />
+            <col style="width: 140px" />
+            <col style="width: 140px" />
+          </colgroup>
+          <thead>
+            <tr class="income-header">
+              <th>INCOME</th>
+              <th style="text-align: right">Planned</th>
+              <th style="text-align: right">Actual</th>
+              <th></th>
+              <th style="text-align: right">From {formatMonthShort(getPrevMonth(selectedMonth))}</th>
+              <th style="text-align: right">Balance</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each incomeActuals as actual, i}
+              {@const globalIndex = i}
+              {@const incomingRollover = getCategoryIncomingRollover(actual.category)}
+              {@const balance = roundToCents(incomingRollover + actual.variance)}
+              <tr
+                class:selected={cursorIndex === globalIndex}
+                data-index={globalIndex}
+                onclick={() => handleRowClick(globalIndex)}
+                ondblclick={() => handleRowDoubleClick(globalIndex)}
+                oncontextmenu={(e) => handleContextMenu(actual, e)}
+                onkeydown={(e) => e.key === 'Enter' && handleRowDoubleClick(globalIndex)}
+                role="option"
+                aria-selected={cursorIndex === globalIndex}
+                tabindex={cursorIndex === globalIndex ? 0 : -1}
+              >
+                <td class="row-name">{actual.category}</td>
+                <td class="col-number col-muted">{formatCurrency(actual.expected)}</td>
+                <td class="col-number">{formatCurrency(actual.actual)}</td>
+                <td class="row-bar"><div class="bar-bg"><div class="bar-fill" style="width: {Math.min(actual.percentUsed, 100)}%; background: {actual.percentUsed >= 100 ? 'var(--accent-success, #22c55e)' : 'var(--accent-primary)'}"></div></div></td>
+                <td class="col-number col-rollover">
+                  {#if incomingRollover !== 0}
+                    <span class:positive={incomingRollover > 0} class:negative={incomingRollover < 0}>{formatCurrency(incomingRollover)}</span>
+                  {/if}
+                </td>
+                <td class="col-number" class:positive={balance >= 0} class:negative={balance < 0}>{formatCurrency(balance)}</td>
+              </tr>
+            {/each}
+            <tr class="summary-row">
+              <td></td>
+              <td class="col-number col-muted">{formatCurrency(incomeSummary.expected)}</td>
+              <td class="col-number">{formatCurrency(incomeSummary.actual)}</td>
+              <td></td>
+              <td></td>
+              <td class="col-number" class:positive={incomeSummary.balance >= 0} class:negative={incomeSummary.balance < 0}>{formatCurrency(incomeSummary.balance)}</td>
+            </tr>
+            <tr class="add-row-tr"><td colspan="6"><button class="add-row" onclick={() => startAddCategory("income")}>+ Add income</button></td></tr>
+          </tbody>
+        </table>
 
         <!-- Budget Section -->
-        <div class="section">
-          <div class="section-header budget-header">
-            <div class="row-name section-title">BUDGET</div>
-            <div class="row-bar"></div>
-            <div class="row-actual">{formatCurrency(budgetSummary.actual)}</div>
-            <div class="row-expected">/ {formatCurrency(budgetSummary.expected)}</div>
-            <div class="row-percent" style="color: {budgetSummary.percent > 100 ? 'var(--accent-danger, #ef4444)' : budgetSummary.percent > 90 ? 'var(--accent-warning, #f59e0b)' : 'var(--accent-success, #22c55e)'}">{budgetSummary.percent}%</div>
-            <div class="transfer-btn-placeholder"></div>
-            <div class="row-details-placeholder"></div>
-          </div>
-          {#each budgetActuals as actual, i}
-            {@const globalIndex = incomeActuals.length + i}
-            {@const incoming = incomingTransfers.filter(t => t.toCategory === actual.category)}
-            {@const incomingRollover = roundToCents(incoming.reduce((sum, t) => sum + t.amount, 0))}
-            {@const outgoing = outgoingTransfers.filter(t => t.fromCategory === actual.category)}
-            {@const outgoingRollover = roundToCents(outgoing.reduce((sum, t) => sum + t.amount, 0))}
-            {@const effectiveActual = roundToCents(actual.actual - incomingRollover)}
-            {@const effectivePercent = actual.expected > 0 ? Math.round((effectiveActual / actual.expected) * 100) : 0}
-            <div
-              class="row"
-              class:cursor={cursorIndex === globalIndex}
-              data-index={globalIndex}
-              onclick={() => handleRowClick(globalIndex)}
-              ondblclick={() => handleRowDoubleClick(globalIndex)}
-              onkeydown={(e) => e.key === 'Enter' && handleRowDoubleClick(globalIndex)}
-              role="option"
-              aria-selected={cursorIndex === globalIndex}
-              tabindex={cursorIndex === globalIndex ? 0 : -1}
-            >
-              <div class="row-name">{actual.category}</div>
-              <div class="row-bar">
-                <div class="bar-bg"><div class="bar-fill" style="width: {Math.min(Math.max(effectivePercent, 0), 100)}%; background: {getStatusColor({...actual, percentUsed: effectivePercent})}"></div></div>
-              </div>
-              <div class="row-actual">{formatCurrency(effectiveActual)}</div>
-              <div class="row-expected">/ {formatCurrency(actual.expected)}</div>
-              <div class="row-percent" style="color: {getStatusColor({...actual, percentUsed: effectivePercent})}">{effectivePercent}%</div>
-              <button
-                class="transfer-btn"
-                class:has-outgoing={outgoing.length > 0}
-                onclick={(e) => openTransferModal(actual, e)}
-                title={outgoing.length > 0 ? `${formatCurrency(outgoingRollover)} to ${formatMonth(getNextMonth(selectedMonth))}` : "Roll over to next month"}
-              >&#8594;</button>
-              <!-- Inline RowMenu -->
-              {#if menuOpenForId === actual.id}
-                <button class="menu-backdrop" onclick={(e) => { e.stopPropagation(); closeMenu(); }} aria-label="Close menu"></button>
-              {/if}
-              <div class="row-menu">
-                <button class="row-menu-btn" onclick={(e) => toggleMenu(actual.id, e)} aria-haspopup="true" aria-expanded={menuOpenForId === actual.id}>&#8942;</button>
-                {#if menuOpenForId === actual.id}
-                  <div class="row-menu-dropdown" role="menu">
-                    <button class="menu-item" onclick={() => { loadTransactionsForCategory(actual); closeMenu(); }} role="menuitem">View</button>
-                    <button class="menu-item" onclick={() => { const cat = categories.find(c => c.id === actual.id); if (cat) startEditCategory(cat); closeMenu(); }} role="menuitem">Edit</button>
-                    <button class="menu-item danger" onclick={() => { const cat = categories.find(c => c.id === actual.id); if (cat) deleteCategory(cat); closeMenu(); }} role="menuitem">Delete</button>
-                  </div>
-                {/if}
-              </div>
-            </div>
-          {/each}
-          <button class="add-row" onclick={() => startAddCategory("expense")}>+ Add category</button>
-        </div>
+        <table class="budget-table">
+          <colgroup>
+            <col style="width: 210px" />
+            <col style="width: 120px" />
+            <col style="width: 120px" />
+            <col />
+            <col style="width: 140px" />
+            <col style="width: 140px" />
+          </colgroup>
+          <thead>
+            <tr class="budget-header">
+              <th>BUDGET</th>
+              <th style="text-align: right">Planned</th>
+              <th style="text-align: right">Actual</th>
+              <th></th>
+              <th style="text-align: right">From {formatMonthShort(getPrevMonth(selectedMonth))}</th>
+              <th style="text-align: right">Balance</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each budgetActuals as actual, i}
+              {@const globalIndex = incomeActuals.length + i}
+              {@const incomingRollover = getCategoryIncomingRollover(actual.category)}
+              {@const balance = roundToCents(incomingRollover + actual.variance)}
+              <tr
+                class:selected={cursorIndex === globalIndex}
+                data-index={globalIndex}
+                onclick={() => handleRowClick(globalIndex)}
+                ondblclick={() => handleRowDoubleClick(globalIndex)}
+                oncontextmenu={(e) => handleContextMenu(actual, e)}
+                onkeydown={(e) => e.key === 'Enter' && handleRowDoubleClick(globalIndex)}
+                role="option"
+                aria-selected={cursorIndex === globalIndex}
+                tabindex={cursorIndex === globalIndex ? 0 : -1}
+              >
+                <td class="row-name">{actual.category}</td>
+                <td class="col-number col-muted">{formatCurrency(actual.expected)}</td>
+                <td class="col-number" style="color: {getStatusColor(actual)}">{formatCurrency(actual.actual)}</td>
+                <td class="row-bar"><div class="bar-bg"><div class="bar-fill" style="width: {Math.min(actual.percentUsed, 100)}%; background: {getStatusColor(actual)}"></div></div></td>
+                <td class="col-number col-rollover">
+                  {#if incomingRollover !== 0}
+                    <span class:positive={incomingRollover > 0} class:negative={incomingRollover < 0}>{formatCurrency(incomingRollover)}</span>
+                  {/if}
+                </td>
+                <td class="col-number" class:positive={balance >= 0} class:negative={balance < 0}>{formatCurrency(balance)}</td>
+              </tr>
+            {/each}
+            <tr class="summary-row">
+              <td></td>
+              <td class="col-number col-muted">{formatCurrency(budgetSummary.expected)}</td>
+              <td class="col-number">{formatCurrency(budgetSummary.actual)}</td>
+              <td></td>
+              <td></td>
+              <td class="col-number" class:positive={budgetSummary.balance >= 0} class:negative={budgetSummary.balance < 0}>{formatCurrency(budgetSummary.balance)}</td>
+            </tr>
+            <tr class="add-row-tr"><td colspan="6"><button class="add-row" onclick={() => startAddCategory("expense")}>+ Add category</button></td></tr>
+          </tbody>
+        </table>
       {/if}
     </div>
 
@@ -1139,28 +1326,27 @@
           {/if}
         </div>
 
-        {@const effectiveActual = roundToCents(currentActual.actual - currentIncomingNet)}
-        {@const remaining = roundToCents(currentActual.expected - effectiveActual)}
+        {@const sidebarBalance = roundToCents(currentIncomingNet + currentActual.variance)}
         <div class="sidebar-section">
-          <div class="sidebar-title">Progress</div>
+          <div class="sidebar-title">Balance</div>
           <div class="detail-row">
-            <span>Budget:</span>
+            <span>Planned:</span>
             <span class="mono">{formatCurrency(currentActual.expected)}</span>
           </div>
           <div class="detail-row">
-            <span>- Spent:</span>
+            <span>Actual:</span>
             <span class="mono">{formatCurrency(currentActual.actual)}</span>
           </div>
+          <div class="detail-row detail-separator"></div>
+          <div class="detail-row detail-remaining">
+            <span>Balance:</span>
+            <span class="mono" class:positive={sidebarBalance >= 0} class:negative={sidebarBalance < 0}>{formatCurrency(sidebarBalance)}</span>
+          </div>
           {#if currentIncomingNet !== 0}
-            <div class="detail-row">
-              <span>+ Rollover:</span>
-              <span class="mono">{formatCurrency(currentIncomingNet)}</span>
+            <div class="detail-row detail-breakdown">
+              <span>{formatCurrency(currentActual.variance)} variance + {formatCurrency(currentIncomingNet)} rollover</span>
             </div>
           {/if}
-          <div class="detail-row detail-remaining">
-            <span>= Remaining:</span>
-            <span class="mono" class:positive={remaining >= 0} class:negative={remaining < 0}>{formatCurrency(remaining)}</span>
-          </div>
         </div>
 
         {#if currentIncomingTransfers.length > 0 || currentOutgoingTransfers.length > 0}
@@ -1435,6 +1621,88 @@
       </div>
     </div>
   {/if}
+
+  {#if contextMenuActual}
+    <button class="menu-backdrop" onclick={closeMenu} aria-label="Close menu"></button>
+    <div class="context-menu" style="left: {contextMenuPos.x}px; top: {contextMenuPos.y}px" role="menu">
+      <button class="menu-item" onclick={() => { if (contextMenuActual) loadTransactionsForCategory(contextMenuActual); closeMenu(); }} role="menuitem">View transactions</button>
+      {#if contextMenuActual.type === 'expense'}
+        <button class="menu-item" onclick={() => { if (contextMenuActual) openTransferModal(contextMenuActual, new MouseEvent('click')); closeMenu(); }} role="menuitem">Roll over to {formatMonthShort(getNextMonth(selectedMonth))}</button>
+      {/if}
+      <button class="menu-item" onclick={() => { const cat = categories.find(c => c.id === contextMenuActual?.id); if (cat) startEditCategory(cat); closeMenu(); }} role="menuitem">Edit category</button>
+      <button class="menu-item danger" onclick={() => { const cat = categories.find(c => c.id === contextMenuActual?.id); if (cat) deleteCategory(cat); closeMenu(); }} role="menuitem">Delete</button>
+    </div>
+  {/if}
+
+
+  {#if showRolloversModal}
+    <div class="modal-overlay" onclick={closeRolloversModal} onkeydown={(e) => e.key === "Escape" && closeRolloversModal()} role="dialog" aria-modal="true" tabindex="-1">
+      <div class="modal" style="width: 560px; max-height: 80vh" onclick={(e) => e.stopPropagation()} role="document">
+        <div class="modal-header">
+          <span class="modal-title">Rollovers: {formatMonthShort(rolloversFromMonth)} &rarr; {formatMonthShort(getNextMonth(rolloversFromMonth))}</span>
+          <button class="modal-close" onclick={closeRolloversModal}>&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="copy-rollover-table-wrap">
+            <table class="copy-rollover-table">
+              <thead>
+                <tr>
+                  <th>From</th>
+                  <th>To</th>
+                  <th style="text-align: right">Balance</th>
+                  <th style="text-align: right">Amount</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each copyRolloverRows as row, i}
+                  <tr>
+                    <td>
+                      <select class="tl-select copy-rollover-select" bind:value={copyRolloverRows[i].category}>
+                        {#each budgetActuals as cat}
+                          <option value={cat.category}>{cat.category}</option>
+                        {/each}
+                      </select>
+                    </td>
+                    <td>
+                      <select class="tl-select copy-rollover-select" bind:value={copyRolloverRows[i].toCategory}>
+                        {#each budgetActuals as cat}
+                          <option value={cat.category}>{cat.category}</option>
+                        {/each}
+                      </select>
+                    </td>
+                    <td class="col-number" class:positive={getCategoryBalance(row.category) > 0} class:negative={getCategoryBalance(row.category) < 0}>{formatCurrency(getCategoryBalance(row.category))}</td>
+                    <td class="copy-rollover-input-cell">
+                      <input
+                        type="number"
+                        class="tl-input copy-rollover-input"
+                        bind:value={copyRolloverRows[i].rolloverAmount}
+                        step="1"
+                      />
+                    </td>
+                    <td class="copy-rollover-remove">
+                      <button class="tl-btn tl-btn-icon" onclick={() => removeRolloverRow(i)} title="Remove">&times;</button>
+                    </td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+          <button class="tl-btn tl-btn-text" onclick={addRolloverRow}>+ Add row</button>
+        </div>
+        <div class="modal-actions rollover-modal-actions">
+          <div class="rollover-bulk-actions">
+            <button class="tl-btn tl-btn-secondary" onclick={copyRolloverAll}>Roll over all</button>
+            <button class="tl-btn tl-btn-secondary" onclick={copyRolloverNone}>Clear all</button>
+          </div>
+          <div class="rollover-save-actions">
+            <button class="tl-btn tl-btn-secondary" onclick={closeRolloversModal}>Cancel</button>
+            <button class="tl-btn tl-btn-primary" onclick={saveRolloversFromModal}>Save</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -1606,6 +1874,8 @@
   .copy-from-previous {
     padding: var(--spacing-xl);
     text-align: center;
+    max-width: 480px;
+    margin: 0 auto;
   }
 
   .copy-prompt p {
@@ -1624,6 +1894,65 @@
     flex-direction: column;
     gap: var(--spacing-md);
     align-items: center;
+  }
+
+  .copy-rollover-table-wrap {
+    max-height: 300px;
+    overflow-y: auto;
+    margin: var(--spacing-md) 0;
+    text-align: left;
+  }
+  .copy-rollover-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  .copy-rollover-table th {
+    text-align: left;
+    padding: 4px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border-primary);
+    position: sticky;
+    top: 0;
+    background: var(--bg-primary);
+  }
+  .copy-rollover-table td {
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--border-primary);
+    color: var(--text-primary);
+    font-size: 13px;
+  }
+  .copy-rollover-input-cell {
+    text-align: right;
+  }
+  .copy-rollover-select {
+    width: 100%;
+    font-size: 12px;
+    padding: 3px 6px;
+  }
+  .copy-rollover-input {
+    width: 90px;
+    text-align: right;
+    font-family: var(--font-mono);
+    -moz-appearance: textfield;
+  }
+  .copy-rollover-input::-webkit-inner-spin-button,
+  .copy-rollover-input::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  .rollover-modal-actions {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .rollover-bulk-actions, .rollover-save-actions {
+    display: flex;
+    gap: var(--spacing-sm);
   }
 
   .copy-select-row, .reset-row {
@@ -1648,147 +1977,123 @@
     cursor: pointer;
   }
 
-  .section-divider {
-    height: 12px;
-    background: var(--bg-primary);
-    border-top: 1px solid var(--border-primary);
-    border-bottom: 1px solid var(--border-primary);
+  /* Budget table - fully scoped, no SDK overrides needed */
+  .budget-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+    font-size: 13px;
   }
 
-  .section-header {
-    display: flex;
-    align-items: center;
-    padding: 8px var(--spacing-lg);
-    background: var(--bg-tertiary);
-    border-bottom: 1px solid var(--border-primary);
-    gap: var(--spacing-md);
-  }
-
-  .section-header.income-header {
-    border-left: 3px solid var(--accent-success, #22c55e);
-    padding-left: calc(var(--spacing-lg) - 3px);
-  }
-
-  .section-header.income-header .section-title {
-    color: var(--accent-success, #22c55e);
-  }
-
-  .section-header.budget-header {
-    border-left: 3px solid var(--accent-primary, #3b82f6);
-    padding-left: calc(var(--spacing-lg) - 3px);
-  }
-
-  .section-header.budget-header .section-title {
-    color: var(--accent-primary, #3b82f6);
-  }
-
-  .section-title {
-    font-weight: 700;
-    color: var(--text-primary);
-  }
-
-  /* Remaining Hero Card */
-  .remaining-hero {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: var(--spacing-lg);
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border-primary);
-  }
-
-  .remaining-hero-label {
+  .budget-table th {
+    text-align: left;
+    padding: 6px 12px;
     font-size: 11px;
     font-weight: 600;
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border-primary);
+    white-space: nowrap;
+    background: var(--bg-tertiary);
   }
 
-  .remaining-hero-amount {
-    font-size: 32px;
-    font-weight: 700;
+  .budget-table td {
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border-primary);
+    color: var(--text-primary);
+  }
+
+  .budget-table tbody tr { cursor: pointer; }
+  .budget-table tbody tr:hover { background: var(--bg-secondary); }
+
+  .budget-table tbody tr.selected {
+    background: var(--bg-tertiary);
+    box-shadow: inset 3px 0 0 var(--text-muted);
+  }
+
+  .income-header th:first-child {
+    border-left: 3px solid var(--accent-success, #22c55e);
+    padding-left: 9px;
     color: var(--accent-success, #22c55e);
+  }
+
+  .budget-header th:first-child {
+    border-left: 3px solid var(--accent-primary, #3b82f6);
+    padding-left: 9px;
+    color: var(--accent-primary, #3b82f6);
+  }
+
+  .col-number { font-family: var(--font-mono); text-align: right; white-space: nowrap; }
+  .col-muted { color: var(--text-muted); font-weight: 400; }
+
+  .col-rollover {
+    font-size: 12px;
+    line-height: 1.4;
+  }
+  .col-rollover span {
+    display: block;
+    white-space: nowrap;
+  }
+
+  .summary-row td { font-weight: 600; border-bottom: none; border-top: 2px solid var(--border-primary); background: var(--bg-secondary); }
+  .add-row-tr td { padding: 0; border-bottom: none; }
+
+  /* Remaining Hero Card */
+  /* Summary Metrics */
+  .summary-metrics {
+    display: flex;
+    gap: 1px;
+    background: var(--border-primary);
+    border-bottom: 1px solid var(--border-primary);
+  }
+
+  .metric-card {
+    flex: 1;
+    padding: 16px 20px;
+    background: var(--bg-secondary);
+  }
+
+  .metric-label {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+  }
+
+  .metric-value {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary);
     font-family: var(--font-mono, monospace);
   }
 
-  .remaining-hero.negative .remaining-hero-amount {
-    color: var(--accent-danger, #ef4444);
-  }
-
-  .remaining-hero-detail {
-    font-size: 12px;
-    color: var(--text-muted);
-  }
-
-  /* Pacing Indicator */
-  .pacing-indicator {
-    margin-top: var(--spacing-md);
-    width: 200px;
-  }
-
-  .pacing-bars {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-
-  .pacing-bar {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .pacing-bar-label {
-    width: 36px;
-    font-size: 10px;
-    color: var(--text-muted);
-    text-transform: uppercase;
-  }
-
-  .pacing-bar-track {
-    flex: 1;
-    height: 4px;
-    background: var(--bg-tertiary);
-    border-radius: 2px;
-    overflow: hidden;
-  }
-
-  .pacing-bar-fill {
-    height: 100%;
-    border-radius: 2px;
-    transition: width 0.3s;
-  }
-
-  .pacing-bar-fill.time {
-    background: var(--text-muted);
-  }
-
-  .pacing-bar-fill.spent {
-    background: var(--accent-success, #22c55e);
-  }
-
-  .pacing-bar-fill.spent.behind {
-    background: var(--accent-warning, #f59e0b);
-  }
-
-  .pacing-bar-fill.spent.over {
-    background: var(--accent-danger, #ef4444);
-  }
-
-  .pacing-bar-value {
-    width: 32px;
-    font-size: 10px;
-    color: var(--text-muted);
-    text-align: right;
-  }
-
-  .pacing-summary {
-    margin-top: 6px;
+  .metric-sub {
     font-size: 11px;
     color: var(--text-muted);
-    text-align: center;
+    margin-top: 3px;
   }
+
+  .rollover-summary-line {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--spacing-md);
+    padding: 8px 20px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-primary);
+    font-size: 13px;
+  }
+  .rollover-summary-text {
+    color: var(--text-muted);
+  }
+  .rollover-edit-btn {
+    padding: 3px 10px;
+    font-size: 11px;
+  }
+
 
   .add-row {
     display: block;
@@ -1809,39 +2114,19 @@
     color: var(--text-primary);
   }
 
-  .row {
-    display: flex;
-    align-items: center;
-    padding: 8px var(--spacing-lg);
-    border-bottom: 1px solid var(--border-primary);
-    gap: var(--spacing-md);
-    cursor: pointer;
-  }
-
-  .row:hover { background: var(--bg-secondary); }
-
-  .row.cursor {
-    background: var(--bg-tertiary);
-    border-left: 3px solid var(--text-muted);
-    padding-left: calc(var(--spacing-lg) - 3px);
-  }
-
   .row-name {
-    flex: 1;
-    min-width: 100px;
-    color: var(--text-primary);
-    white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .row-bar {
-    width: 80px;
-    flex-shrink: 0;
+    vertical-align: middle;
   }
 
   .bar-bg {
     height: 4px;
+    max-width: 400px;
     background: var(--bg-tertiary);
     border-radius: 2px;
     overflow: hidden;
@@ -1853,65 +2138,6 @@
     transition: width 0.2s;
   }
 
-  .row-actual {
-    width: 90px;
-    flex-shrink: 0;
-    text-align: right;
-    color: var(--text-primary);
-    font-weight: 600;
-    white-space: nowrap;
-  }
-
-  .row-expected {
-    width: 95px;
-    flex-shrink: 0;
-    text-align: right;
-    color: var(--text-muted);
-    white-space: nowrap;
-  }
-
-  .row-percent {
-    width: 50px;
-    flex-shrink: 0;
-    text-align: right;
-    font-weight: 600;
-    white-space: nowrap;
-  }
-
-  .row-details-placeholder, .transfer-btn-placeholder {
-    width: 24px;
-    flex-shrink: 0;
-  }
-
-  .transfer-btn-placeholder { margin-right: 4px; }
-
-  .transfer-btn {
-    width: 24px;
-    height: 24px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border-primary);
-    border-radius: 4px;
-    color: var(--text-muted);
-    font-size: 14px;
-    cursor: pointer;
-    flex-shrink: 0;
-    margin-right: 4px;
-  }
-
-  .transfer-btn:hover {
-    background: var(--accent-primary);
-    border-color: var(--accent-primary);
-    color: white;
-  }
-
-  .transfer-btn.has-outgoing {
-    background: var(--accent-primary);
-    border-color: var(--accent-primary);
-    color: white;
-  }
 
   .sidebar {
     width: 200px;
@@ -1984,6 +2210,17 @@
   .detail-row.detail-remaining {
     font-weight: 600;
     color: var(--text-primary);
+  }
+
+  .detail-row.detail-separator {
+    border-top: 1px solid var(--border-primary);
+    margin: 4px 0;
+    padding: 0;
+  }
+
+  .detail-row.detail-breakdown {
+    font-size: 10px;
+    color: var(--text-muted);
   }
 
   .mono { font-family: var(--font-mono); }
@@ -2158,7 +2395,7 @@
     color: var(--text-primary);
   }
 
-  .close-btn {
+  .close-btn, .modal-close {
     background: none;
     border: none;
     font-size: 20px;
@@ -2173,7 +2410,7 @@
     justify-content: center;
   }
 
-  .close-btn:hover {
+  .close-btn:hover, .modal-close:hover {
     color: var(--text-primary);
   }
 
@@ -2348,53 +2585,16 @@
     cursor: default;
   }
 
-  .row-menu {
-    position: relative;
-    flex-shrink: 0;
-  }
-
-  .row-menu-btn {
-    width: 24px;
-    height: 24px;
-    padding: 0;
-    background: transparent;
-    border: 1px solid var(--border-primary);
-    border-radius: 4px;
-    color: var(--text-muted);
-    font-size: 14px;
-    cursor: pointer;
-    opacity: 0;
-    transition: opacity 0.15s;
-    flex-shrink: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .row:hover .row-menu-btn,
-  .row.cursor .row-menu-btn,
-  .row-menu-btn[aria-expanded="true"] {
-    opacity: 1;
-  }
-
-  .row-menu-btn:hover {
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-    border-color: var(--text-muted);
-  }
-
-  .row-menu-dropdown {
-    position: absolute;
-    top: 100%;
-    right: 0;
-    z-index: 100;
-    min-width: 120px;
+  .context-menu {
+    position: fixed;
+    z-index: 200;
+    min-width: 160px;
     background: var(--bg-secondary);
     border: 1px solid var(--border-primary);
     border-radius: 6px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
     overflow: hidden;
-    margin-top: 2px;
+    padding: 4px 0;
   }
 
   .menu-item {
