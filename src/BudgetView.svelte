@@ -1151,8 +1151,8 @@
           </div>
           <div class="metric-card">
             <div class="metric-label">Balance</div>
-            <div class="metric-value" class:positive={budgetSummary.balance >= 0} class:negative={budgetSummary.balance < 0}>{formatCurrency(budgetSummary.balance)}</div>
-            <div class="metric-sub">incl. rollovers</div>
+            <div class="metric-value" class:positive={incomeSummary.balance + budgetSummary.balance >= 0} class:negative={incomeSummary.balance + budgetSummary.balance < 0}>{formatCurrency(roundToCents(incomeSummary.balance + budgetSummary.balance))}</div>
+            <div class="metric-sub">income + expenses</div>
           </div>
           <div class="metric-card">
             <div class="metric-label">Progress</div>
