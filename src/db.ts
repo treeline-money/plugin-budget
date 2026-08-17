@@ -11,7 +11,7 @@
  */
 
 import type { PluginSDK } from "@treeline-money/plugin-sdk";
-import type { BudgetCategory, BudgetConfig, BudgetConfigCategory, Transfer, AmountSign } from "./types";
+import type { BudgetCategory, BudgetConfig, BudgetConfigCategory, CoverageRow, Transfer, AmountSign } from "./types";
 
 // Note: Tables are created by migrations in index.ts
 // This file only contains data operations
@@ -400,4 +400,58 @@ export function getPreviousMonth(month: string): string {
   const [year, m] = month.split("-").map(Number);
   const prevDate = new Date(year, m - 2, 1);
   return `${prevDate.getFullYear()}-${String(prevDate.getMonth() + 1).padStart(2, "0")}`;
+}
+
+// ============================================================================
+// COVERAGE OPERATIONS
+// ============================================================================
+
+/**
+ * Load coverage for a month: one row per transaction, with the budget
+ * categories it matched. Defined by migration 3 as plugin_budget.coverage(month)
+ * so the UI, `tl doctor`, and agents share one definition of "matched".
+ */
+export async function loadCoverage(sdk: PluginSDK, month: string): Promise<CoverageRow[]> {
+  const result = await sdk.query<unknown[]>(`
+    SELECT transaction_id, transaction_date, description, amount, tags,
+           account_name, matched_categories, match_count
+    FROM plugin_budget.coverage(?)
+    ORDER BY ABS(amount) DESC
+  `, [month]);
+
+  return result.map((row) => ({
+    transaction_id: row[0] as string,
+    transaction_date: row[1] as string,
+    description: row[2] as string,
+    amount: row[3] as number,
+    tags: (row[4] as string[]) || [],
+    account_name: row[5] as string,
+    matched_categories: (row[6] as string[]) || [],
+    match_count: Number(row[7] ?? 0),
+  }));
+}
+
+/**
+ * Tags the user has said don't need a budget category (transfers, etc.).
+ * Global, not month-scoped.
+ */
+export async function loadIgnoredTags(sdk: PluginSDK): Promise<string[]> {
+  const result = await sdk.query<unknown[]>(`
+    SELECT tag FROM plugin_budget.ignored_tags ORDER BY tag
+  `);
+  return result.map((row) => row[0] as string);
+}
+
+export async function ignoreTag(sdk: PluginSDK, tag: string): Promise<void> {
+  // JS-computed timestamp to avoid ICU extension dependency
+  const now = new Date().toISOString();
+  await sdk.execute(
+    `INSERT INTO plugin_budget.ignored_tags (tag, created_at) VALUES (?, ?::TIMESTAMP)
+     ON CONFLICT (tag) DO NOTHING`,
+    [tag, now]
+  );
+}
+
+export async function unignoreTag(sdk: PluginSDK, tag: string): Promise<void> {
+  await sdk.execute(`DELETE FROM plugin_budget.ignored_tags WHERE tag = ?`, [tag]);
 }

@@ -17,7 +17,7 @@ The Budget plugin allows users to track spending against tag-based budget catego
 
 ### Database Tables
 
-The plugin uses the `plugin_budget` schema with two tables:
+The plugin uses the `plugin_budget` schema with three tables:
 
 **`plugin_budget.categories`**
 - `category_id` - UUID primary key
@@ -37,6 +37,51 @@ The plugin uses the `plugin_budget` schema with two tables:
 - `to_category` - Destination category name
 - `to_month` - Month the rollover applies to
 - `amount` - Amount being transferred
+
+**`plugin_budget.ignored_tags`** (migration 3)
+- `tag` - Primary key. Tags the user has said don't need a budget category (transfers, reimbursements).
+- `created_at` - When it was ignored
+
+Global, not month-scoped, and it only suppresses the unbudgeted check - it never
+affects actuals.
+
+### Coverage (migration 3)
+
+One definition of "which categories did this transaction match", shared by the
+UI, `tl doctor`, and agents. Matching mirrors `calculateActualsForMonth`: any/all
+tags, optional `amount_sign`, bucketed by `transaction_date`.
+
+- **`plugin_budget.coverage_all`** - view, every transaction with its matched
+  categories, keyed by `month`. The shared implementation; query it directly
+  when you need more than one month.
+- **`plugin_budget.coverage(month)`** - table macro over that view for one
+  `'YYYY-MM'`. Returns `transaction_id, transaction_date, description, amount,
+  tags, account_name, matched_categories` (list, may be empty) and
+  `match_count`. `match_count = 0` is unbudgeted, `>= 2` is double counted -
+  which is sometimes deliberate, so the UI flags rather than corrects it.
+- **`plugin_budget.doctor`** - view core reads to publish plugin checks. See below.
+
+Both use `CREATE OR REPLACE`, so a later migration can revise them.
+
+### The `doctor` view contract
+
+Core discovers `<schema>.doctor` by convention, runs
+`SELECT to_json(d) FROM plugin_budget.doctor d`, and reports each row as
+`budget.<check_id>` in `tl doctor` and MCP. **Do not change these columns
+without coordinating with core:**
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `check_id` | VARCHAR | `double_counted`, `unbudgeted_tags` |
+| `name` | VARCHAR | Human label |
+| `status` | VARCHAR | `pass` / `warning` / `error` |
+| `message` | VARCHAR | One line |
+| `details` | LIST(JSON) | Sample rows, capped at 50; NULL when passing |
+
+Scope is the current month plus the two prior, and only months that actually
+have categories - a month with nothing set up is "not set up", not "everything
+unbudgeted". Month arithmetic uses `strftime(now()::TIMESTAMP, ...)`, never
+`CURRENT_DATE` (the icu extension isn't loaded).
 
 ### SDK Usage
 
@@ -58,6 +103,11 @@ const { sdk }: { sdk: PluginSDK } = $props();
 
 ### Month-Scoped Categories
 Each month has its own complete set of categories. Categories are not inherited - users copy from a previous month when setting up a new one.
+
+### Coverage Flagging
+Transactions that matched two or more categories, or none, surface as a line
+under the metrics row and a drill-down modal. Additive - it never changes the
+actuals computation.
 
 ### Tag-Based Matching
 Categories match transactions by tags. Options:

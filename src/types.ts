@@ -70,3 +70,12 @@ export interface Transaction {
   tags: string[];
   account_name: string;
 }
+
+/**
+ * One row per transaction in a month, from plugin_budget.coverage(month).
+ * match_count 0 = matched no budget category, 2+ = counted in several.
+ */
+export interface CoverageRow extends Transaction {
+  matched_categories: string[];
+  match_count: number;
+}

@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import type { PluginSDK } from "@treeline-money/plugin-sdk";
   import type { Snippet } from "svelte";
-  import type { BudgetCategory, BudgetActual, BudgetType, AmountSign, Transaction, Transfer } from "./types";
+  import type { BudgetCategory, BudgetActual, BudgetType, AmountSign, CoverageRow, Transaction, Transfer } from "./types";
   import * as budgetDb from "./db";
 
   // Props from plugin SDK
@@ -41,6 +41,12 @@
   let drillDownCategory = $state<BudgetActual | null>(null);
   let drillDownTransactions = $state<Transaction[]>([]);
   let drillDownLoading = $state(false);
+
+  // Coverage: which transactions matched 0 or 2+ budget categories this month
+  let coverageRows = $state<CoverageRow[]>([]);
+  let ignoredTags = $state<string[]>([]);
+  let showCoverage = $state(false);
+  let showIgnoredTags = $state(false);
 
   // Context menu state
   let contextMenuActual = $state<BudgetActual | null>(null);
@@ -580,6 +586,137 @@
 
   async function calculateActuals() {
     actuals = await calculateActualsForMonth(selectedMonth);
+    await loadCoverage();
+  }
+
+  // ==========================================================================
+  // Coverage: transactions matching 0 or 2+ categories (additive to actuals)
+  // ==========================================================================
+
+  async function loadCoverage() {
+    if (!selectedMonth) {
+      coverageRows = [];
+      return;
+    }
+    try {
+      const [rows, ignored] = await Promise.all([
+        budgetDb.loadCoverage(sdk, selectedMonth),
+        budgetDb.loadIgnoredTags(sdk),
+      ]);
+      coverageRows = rows;
+      ignoredTags = ignored;
+    } catch (e) {
+      // Migration 3 may not have run yet (older database) - coverage is optional
+      console.warn("Coverage unavailable:", e);
+      coverageRows = [];
+      ignoredTags = [];
+    }
+  }
+
+  // Account filter is applied here rather than in SQL, matching the drill-downs
+  let filteredCoverage = $derived(
+    selectedAccounts.length === 0
+      ? coverageRows
+      : coverageRows.filter(r => selectedAccounts.includes(r.account_name))
+  );
+
+  let doubleCounted = $derived(filteredCoverage.filter(r => r.match_count > 1));
+  let untaggedRows = $derived(filteredCoverage.filter(r => r.tags.length === 0));
+
+  interface UnbudgetedGroup {
+    tag: string;
+    total: number;
+    txns: CoverageRow[];
+  }
+
+  let unbudgetedGroups = $derived.by<UnbudgetedGroup[]>(() => {
+    const groups = new Map<string, UnbudgetedGroup>();
+    for (const row of filteredCoverage) {
+      if (row.match_count !== 0 || row.tags.length === 0) continue;
+      for (const tag of row.tags) {
+        if (ignoredTags.includes(tag)) continue;
+        let group = groups.get(tag);
+        if (!group) {
+          group = { tag, total: 0, txns: [] };
+          groups.set(tag, group);
+        }
+        group.total += row.amount;
+        group.txns.push(row);
+      }
+    }
+    return Array.from(groups.values()).sort((a, b) => Math.abs(b.total) - Math.abs(a.total));
+  });
+
+  let coverageTotal = $derived(doubleCounted.length + unbudgetedGroups.length + untaggedRows.length);
+
+  let coverageSummary = $derived([
+    doubleCounted.length > 0 ? `${doubleCounted.length} counted twice` : null,
+    unbudgetedGroups.length > 0 ? `${unbudgetedGroups.length} unbudgeted tag${unbudgetedGroups.length === 1 ? "" : "s"}` : null,
+    untaggedRows.length > 0 ? `${untaggedRows.length} untagged` : null,
+  ].filter(Boolean).join(" \u00b7 "));
+
+  // Tags this month's categories actually watch - used for the typo hint
+  let categoryTags = $derived([...new Set(categories.flatMap(c => c.tags))]);
+
+  // Levenshtein distance, iterative two-row version (no library)
+  function levenshtein(a: string, b: string): number {
+    if (a === b) return 0;
+    if (a.length === 0) return b.length;
+    if (b.length === 0) return a.length;
+    let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+    for (let i = 1; i <= a.length; i++) {
+      const curr = [i];
+      for (let j = 1; j <= b.length; j++) {
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+      }
+      prev = curr;
+    }
+    return prev[b.length];
+  }
+
+  // Nearest tag one of this month's categories watches, if it's close enough
+  // to be worth asking about. A hint, never a conclusion.
+  function similarCategoryTag(tag: string): string | null {
+    let best: string | null = null;
+    let bestDistance = 3;
+    for (const candidate of categoryTags) {
+      const distance = levenshtein(tag.toLowerCase(), candidate.toLowerCase());
+      if (distance > 0 && distance < bestDistance) {
+        bestDistance = distance;
+        best = candidate;
+      }
+    }
+    return best;
+  }
+
+  function openCoverage() {
+    showCoverage = true;
+  }
+
+  function closeCoverage() {
+    showCoverage = false;
+    showIgnoredTags = false;
+    containerEl?.focus();
+  }
+
+  async function addIgnoredTag(tag: string) {
+    try {
+      await budgetDb.ignoreTag(sdk, tag);
+      await loadCoverage();
+      sdk.toast.success(`Ignoring "${tag}"`);
+    } catch (e) {
+      sdk.toast.error(`Could not ignore "${tag}"`);
+    }
+  }
+
+  async function removeIgnoredTag(tag: string) {
+    try {
+      await budgetDb.unignoreTag(sdk, tag);
+      await loadCoverage();
+    } catch (e) {
+      sdk.toast.error(`Could not un-ignore "${tag}"`);
+    }
   }
 
   // Load trends for a single category (on-demand when selected)
@@ -765,7 +902,7 @@
   }
 
   function handleKeyDown(e: KeyboardEvent) {
-    if (isEditing || showTransactions || showTransferModal || showRolloversModal || showResetModal) return;
+    if (isEditing || showTransactions || showCoverage || showTransferModal || showRolloversModal || showResetModal) return;
     if ((e.metaKey || e.ctrlKey) && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
       e.preventDefault();
       moveCategory(e.key === "ArrowUp" ? "up" : "down");
@@ -1171,6 +1308,13 @@
           </div>
         </div>
 
+        {#if coverageTotal > 0}
+          <button class="coverage-line" onclick={openCoverage} title="Transactions that matched more than one budget category, or none">
+            <span class="coverage-warn">&#9888;</span>
+            <span class="coverage-line-text">{coverageSummary}</span>
+          </button>
+        {/if}
+
         <div class="rollover-summary-line">
           <span class="rollover-summary-text">
             Rollovers to {formatMonthShort(getNextMonth(selectedMonth))}:
@@ -1468,6 +1612,114 @@
         <div class="modal-actions">
           <button class="btn danger" onclick={handleModalDelete}>Delete</button>
           <button class="btn secondary" onclick={handleModalEdit}>Edit</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  <!-- Coverage Modal: double counted / unbudgeted / untagged -->
+  {#if showCoverage}
+    <div class="modal-overlay" onclick={closeCoverage} onkeydown={(e) => e.key === "Escape" && closeCoverage()} role="dialog" aria-modal="true" tabindex="-1">
+      <div class="modal" style="width: 620px; max-height: 80vh" onclick={(e) => e.stopPropagation()} role="document">
+        <div class="modal-header">
+          <span class="modal-title">Coverage &#8212; {formatMonth(selectedMonth)}</span>
+          <button class="close-btn" onclick={closeCoverage} aria-label="Close">&#215;</button>
+        </div>
+        <div class="modal-body">
+          <p class="coverage-intro">
+            Transactions this month that matched more than one budget category, or none at all.
+            Overlap is often deliberate &#8212; an umbrella category sitting on top of specific ones &#8212;
+            so read these as questions, not errors.
+          </p>
+
+          {#if coverageTotal === 0}
+            <div class="modal-empty">Every tagged transaction matched exactly one category.</div>
+          {/if}
+
+          {#if doubleCounted.length > 0}
+            <div class="coverage-section">
+              <div class="coverage-section-header">
+                Double counted <span class="coverage-count">{doubleCounted.length}</span>
+              </div>
+              {#each doubleCounted as txn (txn.transaction_id)}
+                <div class="coverage-entry">
+                  <div class="txn-row">
+                    <span class="txn-date">{txn.transaction_date}</span>
+                    <span class="txn-desc">{txn.description}</span>
+                    <span class="txn-amount" class:negative={txn.amount < 0}>{formatCurrency(txn.amount)}</span>
+                  </div>
+                  <div class="coverage-matched">
+                    {#each txn.matched_categories as name}
+                      <span class="coverage-chip">{name}</span>
+                    {/each}
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          {#if unbudgetedGroups.length > 0}
+            <div class="coverage-section">
+              <div class="coverage-section-header">
+                Unbudgeted tags <span class="coverage-count">{unbudgetedGroups.length}</span>
+              </div>
+              {#each unbudgetedGroups as group (group.tag)}
+                {@const hint = similarCategoryTag(group.tag)}
+                <div class="tag-group">
+                  <div class="tag-group-header">
+                    <span class="tag-name">{group.tag}</span>
+                    <span class="tag-meta">{group.txns.length} txn{group.txns.length === 1 ? "" : "s"}</span>
+                    {#if hint}
+                      <span class="tag-hint">similar to &#171;{hint}&#187;</span>
+                    {/if}
+                    <span class="tag-total">{formatCurrency(group.total)}</span>
+                    <button class="btn secondary tag-ignore-btn" onclick={() => addIgnoredTag(group.tag)}>Ignore tag</button>
+                  </div>
+                  {#each group.txns as txn (txn.transaction_id)}
+                    <div class="txn-row">
+                      <span class="txn-date">{txn.transaction_date}</span>
+                      <span class="txn-desc">{txn.description}</span>
+                      <span class="txn-amount" class:negative={txn.amount < 0}>{formatCurrency(txn.amount)}</span>
+                    </div>
+                  {/each}
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          {#if untaggedRows.length > 0}
+            <div class="coverage-section">
+              <div class="coverage-section-header">
+                Untagged <span class="coverage-count">{untaggedRows.length}</span>
+              </div>
+              {#each untaggedRows as txn (txn.transaction_id)}
+                <div class="txn-row">
+                  <span class="txn-date">{txn.transaction_date}</span>
+                  <span class="txn-desc">{txn.description}</span>
+                  <span class="txn-amount" class:negative={txn.amount < 0}>{formatCurrency(txn.amount)}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </div>
+        <div class="coverage-ignored">
+          <button class="ignored-toggle" onclick={() => (showIgnoredTags = !showIgnoredTags)}>
+            {showIgnoredTags ? "\u25be" : "\u25b8"} Ignored tags ({ignoredTags.length})
+          </button>
+          {#if showIgnoredTags}
+            {#if ignoredTags.length === 0}
+              <div class="ignored-empty">No tags ignored yet.</div>
+            {:else}
+              <div class="ignored-list">
+                {#each ignoredTags as tag (tag)}
+                  <span class="ignored-chip">
+                    {tag}
+                    <button class="ignored-undo" onclick={() => removeIgnoredTag(tag)} title="Stop ignoring this tag">&#215;</button>
+                  </span>
+                {/each}
+              </div>
+            {/if}
+          {/if}
         </div>
       </div>
     </div>
@@ -2074,6 +2326,175 @@
     font-size: 11px;
     color: var(--text-muted);
     margin-top: 3px;
+  }
+
+  .coverage-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 8px 20px;
+    background: var(--bg-secondary);
+    border: none;
+    border-bottom: 1px solid var(--border-primary);
+    font-family: inherit;
+    font-size: 13px;
+    text-align: left;
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+  .coverage-line:hover {
+    background: var(--bg-tertiary);
+  }
+  .coverage-warn {
+    color: var(--accent-warning, #f59e0b);
+    font-size: 12px;
+  }
+  .coverage-line-text {
+    color: var(--text-secondary);
+  }
+
+  .coverage-intro {
+    margin: 0;
+    padding: var(--spacing-md) var(--spacing-lg);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-primary);
+  }
+
+  .coverage-section {
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+
+  .coverage-section-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px var(--spacing-lg);
+    background: var(--bg-tertiary);
+    border-bottom: 1px solid var(--border-primary);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+  }
+  .coverage-count {
+    color: var(--text-muted);
+    font-weight: 400;
+  }
+
+  .coverage-entry {
+    border-bottom: 1px solid var(--border-primary);
+  }
+  .coverage-entry .txn-row {
+    border-bottom: none;
+    padding-bottom: 2px;
+  }
+  .coverage-matched {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 0 var(--spacing-lg) 6px calc(var(--spacing-lg) + 80px);
+  }
+  .coverage-chip {
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+
+  .tag-group {
+    border-bottom: 1px solid var(--border-primary);
+  }
+  .tag-group-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px var(--spacing-lg);
+    font-size: 12px;
+  }
+  .tag-name {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+  .tag-meta {
+    color: var(--text-muted);
+    font-size: 11px;
+  }
+  .tag-hint {
+    color: var(--accent-warning, #f59e0b);
+    font-size: 11px;
+  }
+  .tag-total {
+    margin-left: auto;
+    font-family: var(--font-mono);
+    color: var(--text-secondary);
+  }
+  .tag-ignore-btn {
+    padding: 2px 8px;
+    font-size: 11px;
+  }
+  .tag-group .txn-row {
+    border-bottom: none;
+    opacity: 0.85;
+  }
+
+  .coverage-ignored {
+    padding: var(--spacing-sm) var(--spacing-lg);
+    border-top: 1px solid var(--border-primary);
+    flex-shrink: 0;
+  }
+  .ignored-toggle {
+    background: none;
+    border: none;
+    padding: 0;
+    font-family: inherit;
+    font-size: 11px;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+  .ignored-toggle:hover {
+    color: var(--text-secondary);
+  }
+  .ignored-empty {
+    padding-top: 6px;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .ignored-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding-top: 8px;
+  }
+  .ignored-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    background: var(--bg-tertiary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+  .ignored-undo {
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: 13px;
+    line-height: 1;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+  .ignored-undo:hover {
+    color: var(--text-primary);
   }
 
   .rollover-summary-line {
