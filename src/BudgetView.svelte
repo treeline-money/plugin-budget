@@ -700,6 +700,11 @@
     containerEl?.focus();
   }
 
+  function openUntaggedTransactions() {
+    closeCoverage();
+    sdk.openView("transactions", { filterMode: "untagged" });
+  }
+
   async function addIgnoredTag(tag: string) {
     try {
       await budgetDb.ignoreTag(sdk, tag);
@@ -1691,6 +1696,9 @@
             <div class="coverage-section">
               <div class="coverage-section-header">
                 Untagged <span class="coverage-count">{untaggedRows.length}</span>
+                <button class="coverage-link" onclick={openUntaggedTransactions} title="Open Transactions filtered to untagged">
+                  Tag them &#8594;
+                </button>
               </div>
               {#each untaggedRows as txn (txn.transaction_id)}
                 <div class="txn-row">
@@ -2385,6 +2393,23 @@
     color: var(--text-muted);
     font-weight: 400;
   }
+  .coverage-link {
+    margin-left: auto;
+    background: none;
+    border: none;
+    padding: 0;
+    font-family: inherit;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .coverage-link:hover {
+    color: var(--accent-primary, #3b82f6);
+  }
 
   .coverage-entry {
     border-bottom: 1px solid var(--border-primary);
@@ -2419,26 +2444,42 @@
     font-size: 12px;
   }
   .tag-name {
+    flex: 0 0 auto;
     font-family: var(--font-mono);
     font-weight: 600;
     color: var(--text-primary);
+    white-space: nowrap;
   }
   .tag-meta {
+    flex: 0 0 auto;
     color: var(--text-muted);
     font-size: 11px;
+    white-space: nowrap;
   }
+  /* The hint is the flexible one - it truncates before the total or button do. */
   .tag-hint {
+    flex: 0 1 auto;
+    min-width: 0;
     color: var(--accent-warning, #f59e0b);
     font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .tag-total {
+    flex: 0 0 auto;
+    min-width: 92px;
     margin-left: auto;
+    text-align: right;
     font-family: var(--font-mono);
     color: var(--text-secondary);
+    white-space: nowrap;
   }
   .tag-ignore-btn {
+    flex: 0 0 auto;
     padding: 2px 8px;
     font-size: 11px;
+    white-space: nowrap;
   }
   .tag-group .txn-row {
     border-bottom: none;
@@ -2870,21 +2911,26 @@
   }
 
   .txn-date {
-    width: 80px;
+    flex: 0 0 80px;
     color: var(--text-muted);
+    white-space: nowrap;
   }
 
   .txn-desc {
-    flex: 1;
+    flex: 1 1 auto;
+    min-width: 0;
     color: var(--text-primary);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
 
+  /* Wide enough for -$12,345.67 without wrapping; description truncates instead. */
   .txn-amount {
-    width: 70px;
+    flex: 0 0 auto;
+    min-width: 92px;
     text-align: right;
+    white-space: nowrap;
     color: var(--text-primary);
   }
 
